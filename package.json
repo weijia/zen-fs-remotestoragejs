@@ -1,0 +1,88 @@
+{
+  "name": "zen-fs-remotestoragejs",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "RemoteStorage.js backend for zen-fs - distributed file system interface",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:run": "vitest run",
+    "lint": "eslint src --ext .ts",
+    "lint:fix": "eslint src --ext .ts --fix",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "typecheck": "tsc --noEmit",
+    "clean": "rimraf dist",
+    "prepublishOnly": "npm run clean && npm run build && npm run test:run"
+  },
+  "keywords": [
+    "zen-fs",
+    "filesystem",
+    "remotestorage",
+    "storage",
+    "cloud",
+    "distributed",
+    "backend",
+    "typescript"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/zen-fs-remotestoragejs.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/zen-fs-remotestoragejs/issues"
+  },
+  "homepage": "https://github.com/yourusername/zen-fs-remotestoragejs#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@zenfs/core": "^2.3.3",
+    "express": "^5.1.0",
+    "open": "^10.2.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.0.12",
+    "@typescript-eslint/eslint-plugin": "^8.36.0",
+    "@typescript-eslint/parser": "^8.36.0",
+    "@vitest/ui": "^3.2.4",
+    "eslint": "^9.30.1",
+    "prettier": "^3.6.2",
+    "rimraf": "^5.0.10",
+    "tsup": "^8.5.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  },
+  "vitest": {
+    "test": {
+      "environment": "node",
+      "globals": true,
+      "include": [
+        "tests/**/*.test.ts"
+      ],
+      "exclude": [
+        "node_modules",
+        "dist"
+      ]
+    }
+  }
+}

@@ -29,6 +29,27 @@ import {
  * RemoteStorage filesystem implementation for zen-fs using direct HTTP requests
  */
 export class RemoteStorageFileSystem extends FileSystem {
+  /**
+   * 校验并标准化路径，抛出异常或返回标准化后的路径
+   */
+  private validateAndNormalizePath(path: string, ensureDir: boolean = false): string {
+    if (!isValidPath(path)) {
+      throw new RemoteStorageError('Invalid path format');
+    }
+    let p = normalizePath(path);
+    if (ensureDir) {
+      p = ensureDirectoryPath(p);
+    }
+    return p;
+  }
+
+  /**
+   * 获取目录下的所有条目，返回标准化后的绝对路径数组
+   */
+  private async getDirectoryEntries(path: string): Promise<string[]> {
+    const entries = await this.readdir(path);
+    return entries.map(entry => joinPath(path, entry));
+  }
   private baseUrl: string;
   private headers: Headers;
   private timeout: number;
@@ -63,30 +84,42 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Make HTTP request with timeout
    */
   private async makeRequest(url: string, options: RequestInit = {}): Promise<Response> {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
-    
-    try {
-      const response = await fetch(url, {
-        ...options,
-        headers: {
-          'Authorization': `Bearer ${this.config.token}`,
-          'Content-Type': 'application/json',
-          ...this.config.headers,
-          ...options.headers,
-        },
-        signal: controller.signal,
-      });
-      
-      clearTimeout(timeoutId);
-      return response;
-    } catch (error) {
-      clearTimeout(timeoutId);
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw new RemoteStorageError('Request timeout');
+    const maxRetries = 3;
+    let lastError: any = null;
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+      try {
+        const response = await fetch(url, {
+          ...options,
+          headers: {
+            'Authorization': `Bearer ${this.config.token}`,
+            'Content-Type': 'application/json',
+            ...this.config.headers,
+            ...options.headers,
+          },
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        return response;
+      } catch (error) {
+        clearTimeout(timeoutId);
+        lastError = error;
+        // 只对网络错误/超时重试，其他错误直接抛出
+        if (error instanceof Error && (error.name === 'AbortError' || error.name === 'FetchError' || error.message?.includes('network'))) {
+          if (attempt < maxRetries - 1) {
+            await new Promise(res => setTimeout(res, 200 * (attempt + 1)));
+            continue;
+          }
+        }
+        if (error instanceof Error && error.name === 'AbortError') {
+          throw new RemoteStorageError('Request timeout');
+        }
+        throw error;
       }
-      throw error;
     }
+    // 如果重试后仍失败，抛出最后的错误
+    throw lastError || new RemoteStorageError('Unknown HTTP request error');
   }
 
   /**
@@ -113,9 +146,10 @@ export class RemoteStorageFileSystem extends FileSystem {
    */
   private async isDirectory(path: string): Promise<boolean> {
     try {
-      const dirUrl = this.buildUrl(ensureDirectoryPath(path));
+      // 只对目录路径加/，文件路径保持原样
+      const dirUrl = this.buildUrl(path);
       const response = await this.makeRequest(dirUrl, { method: 'GET' });
-      
+
       if (response.ok) {
         const contentType = response.headers.get('content-type') || '';
         return contentType.includes('application/ld+json') || contentType.includes('text/html');
@@ -145,19 +179,13 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Read file contents
    */
   async readFile(path: string): Promise<Uint8Array> {
-    if (!isValidPath(path)) {
-      throw new RemoteStorageError('Invalid path format');
-    }
-
+    path = this.validateAndNormalizePath(path);
     const url = this.buildUrl(path);
-    
     try {
       const response = await this.makeRequest(url, { method: 'GET' });
-      
       if (!response.ok) {
         this.handleHttpError(response, path, 'readFile');
       }
-
       const arrayBuffer = await response.arrayBuffer();
       return new Uint8Array(arrayBuffer);
     } catch (error) {
@@ -174,12 +202,8 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Write file contents
    */
   async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, options?: { flag?: string }): Promise<void> {
-    if (!isValidPath(path)) {
-      throw new RemoteStorageError('Invalid path format');
-    }
-
+    path = this.validateAndNormalizePath(path);
     const flag = options?.flag;
-    
     // Check if file exists for exclusive flags
     if (flag === 'x' || flag === 'wx') {
       const exists = await this.exists(path);
@@ -187,15 +211,11 @@ export class RemoteStorageFileSystem extends FileSystem {
         throw new FileExistsError(path);
       }
     }
-
     const url = this.buildUrl(path);
-    
     try {
       // 直接写文件，不自动创建父目录
-      // Convert data to appropriate format
       let body: BodyInit;
       let contentType: string;
-
       if (typeof data === 'string') {
         body = data;
         contentType = 'text/plain; charset=utf-8';
@@ -208,16 +228,13 @@ export class RemoteStorageFileSystem extends FileSystem {
       } else {
         throw new RemoteStorageError('Unsupported data type for writing');
       }
-
       const headers = new Headers(this.headers);
       headers.set('Content-Type', contentType);
-
       const response = await this.makeRequest(url, {
         method: 'PUT',
         body,
         headers,
       });
-
       if (!response.ok) {
         this.handleHttpError(response, path, 'writeFile');
       }
@@ -235,20 +252,10 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Delete file
    */
   async unlink(path: string): Promise<void> {
-    if (!isValidPath(path)) {
-      throw new RemoteStorageError('Invalid path format');
-    }
-    
+    path = this.validateAndNormalizePath(path);
     try {
-      // Check if file exists and is not a directory
-      const stats = await this.stat(path);
-      if (this.isDirectoryMode(stats.mode)) {
-        throw new RemoteStorageError(`Cannot unlink directory: ${path}`);
-      }
-
       const url = this.buildUrl(path);
       const response = await this.makeRequest(url, { method: 'DELETE' });
-      
       if (!response.ok) {
         this.handleHttpError(response, path, 'unlink');
       }
@@ -266,45 +273,40 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Read directory contents
    */
   async readdir(path: string): Promise<string[]> {
-    if (!isValidPath(path)) {
-      throw new RemoteStorageError('Invalid path format');
-    }
-
-    const dirUrl = this.buildUrl(ensureDirectoryPath(path));
-    
+    path = this.validateAndNormalizePath(path, true);
+    const dirUrl = this.buildUrl(path);
     try {
       const response = await this.makeRequest(dirUrl, { 
         method: 'GET',
-        // headers: {
-        //   'Accept': 'application/ld+json',
-        // },
+        headers: {
+          'Accept': 'application/ld+json',
+        },
       });
-      
       if (!response.ok) {
         this.handleHttpError(response, path, 'readdir');
       }
-
       const contentType = response.headers.get('content-type') || '';
-      
       if (contentType.includes('application/ld+json')) {
-        // Parse JSON-LD directory listing
         const listing = await response.json();
         const items: string[] = [];
-        
         if (listing['@graph']) {
           for (const item of listing['@graph']) {
             if (item['@id'] && item['@id'] !== './') {
-              const name = item['@id'].replace(/\/$/, ''); // Remove trailing slash
+              const name = item['@id'].replace(/\/$/, '');
               if (name) {
                 items.push(name);
               }
             }
           }
+        } else if (listing['items'] && typeof listing['items'] === 'object') {
+          for (const key of Object.keys(listing['items'])) {
+            if (key && key !== './') {
+              items.push(key.replace(/\/$/, ''));
+            }
+          }
         }
-        
         return items;
       } else {
-        // Fallback: parse HTML directory listing
         const html = await response.text();
         return this.parseHtmlDirectoryListing(html);
       }
@@ -346,10 +348,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Create directory
    */
   async mkdir(path: string, options: CreationOptions): Promise<InodeLike> {
-    if (!isValidPath(path)) {
-      throw new RemoteStorageError('Invalid path format');
-    }
-
+    path = this.validateAndNormalizePath(path, true);
     try {
       // 创建占位文件，确保目录可见
       try {
@@ -358,8 +357,6 @@ export class RemoteStorageFileSystem extends FileSystem {
       } catch (e) {
         // 占位文件写入失败不影响主流程
       }
-
-      // Return created directory inode
       return {
         ino: 0,
         mode: options.mode || 0o040755,
@@ -386,29 +383,22 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Remove directory
    */
   async rmdir(path: string): Promise<void> {
-    if (!isValidPath(path)) {
-      throw new RemoteStorageError('Invalid path format');
-    }
-    
+    path = this.validateAndNormalizePath(path, true);
     try {
       // Check if directory exists
       const stats = await this.stat(path);
       if (!this.isDirectoryMode(stats.mode)) {
         throw new RemoteStorageError(`Not a directory: ${path}`);
       }
-
-      // Check if directory is empty
+      // Check directory entries
       const entries = await this.readdir(path);
-      if (entries.length > 0) {
-        throw new RemoteStorageError(`Directory not empty: ${path}`);
+      if (entries.length > 1 || (entries.length === 1 && entries[0] !== '.keep')) {
+        throw new RemoteStorageError(`Directory not empty (except .keep): ${path}`);
       }
-
-      // Remove the directory itself
-      const dirUrl = this.buildUrl(ensureDirectoryPath(path));
-      const response = await this.makeRequest(dirUrl, { method: 'DELETE' });
-      
-      if (!response.ok) {
-        this.handleHttpError(response, path, 'rmdir');
+      // 删除 .keep 占位文件（如果存在）
+      if (entries.includes('.keep')) {
+        const keepFilePath = joinPath(path, '.keep');
+        await this.unlink(keepFilePath);
       }
     } catch (error) {
       if (error instanceof FileNotFoundError || error instanceof DirectoryNotFoundError || error instanceof RemoteStorageError) {
@@ -459,10 +449,12 @@ export class RemoteStorageFileSystem extends FileSystem {
       }
 
       if (this.isFileMode(stats.mode)) {
-        // 文件重命名：读内容，写新路径，删旧路径
+        // 文件重命名：读内容，写新路径，删旧路径（此处已知 oldPath 一定是文件，无需 unlink 再 stat）
         const content = await this.readFile(oldPath);
         await this.writeFile(newPath, content);
-        await this.unlink(oldPath);
+        // 写入和删除之间等待一段时间，避免远端同步延迟导致删除失败
+        // await new Promise(resolve => setTimeout(resolve, 1000));
+        await this.unlink(oldPath); // unlink 已优化，无需再 stat
       } else {
         // 目录重命名：递归复制后删除原目录
         await this.copyDirectoryRecursive(oldPath, newPath);

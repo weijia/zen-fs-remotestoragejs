@@ -65,107 +65,130 @@ async function getTokenViaOAuth(authUrl: string, clientId: string, redirectUri: 
   });
 }
 
+
+// 公共辅助函数
+function ensureLeadingSlash(path: string): string {
+  return path.startsWith('/') ? path : '/' + path;
+}
+
+function logResult(label: string, value: any) {
+  console.log(label, value);
+}
+
+async function safeUnlink(fs: RemoteStorageFileSystem, path: string) {
+  try {
+    await fs.unlink(path);
+    logResult(`Unlinked: ${path}`, 'OK');
+  } catch (e) {
+    logResult(`Unlink failed (ignore): ${path}`, e?.message || e);
+  }
+}
+
+async function safeRmdir(fs: RemoteStorageFileSystem, path: string) {
+  try {
+    await fs.rmdir(path);
+    logResult(`Rmdir: ${path}`, 'OK');
+  } catch (e) {
+    logResult(`Rmdir failed (ignore): ${path}`, e?.message || e);
+  }
+}
+
 async function basicExample() {
   // OAuth2 授权参数（请替换为你的实际参数）
   const authUrl = 'https://5apps.com/rs/oauth/weijia';
-  // const tokenUrl = 'https://storage.5apps.com/oauth/token';
   const clientId = 'http://localhost:8080/callback';
   const redirectUri = 'http://localhost:8080/callback';
-  let token: string;
-  // token = '';
+  let token: string = '';
   if (!token) {
-      try {
-        token = await getTokenViaOAuth(authUrl, clientId, redirectUri);
-        console.log('Fetched token:', token);
-      } catch (err) {
-        console.error('Token fetch failed:', err);
+    try {
+      token = await getTokenViaOAuth(authUrl, clientId, redirectUri);
+      logResult('Fetched token:', token);
+    } catch (err) {
+      logResult('Token fetch failed:', err);
       return;
     }
   }
 
-  // Configure RemoteStorage connection
+  // 配置 RemoteStorage 连接
   const config: RemoteStorageConfig = {
-    href: 'https://storage.5apps.com/weijia',  // Your RemoteStorage endpoint
-    token,  // OAuth bearer token
-    basePath: '',  // Base path for files
+    href: 'https://storage.5apps.com/weijia',
+    token,
+    basePath: '',
     timeout: 30000,
-    headers: {
-      'X-Custom-Header': 'value',
-    },
+    headers: { 'X-Custom-Header': 'value' },
   };
 
   try {
-    // Create filesystem instance
-    console.log('Creating RemoteStorage filesystem...');
+    logResult('Creating RemoteStorage filesystem...', '');
     const fs = new RemoteStorageFileSystem(config);
 
-    console.log('Testing basic file operations...');
+    logResult('Testing basic file operations...', '');
 
-    // Write a file
-    await fs.writeFile('/tests/hello.txt', 'Hello, RemoteStorage with direct HTTP!');
-    console.log('File written successfully');
+    // 写文件
+    await fs.writeFile(ensureLeadingSlash('tests/hello.txt'), 'Hello, RemoteStorage with direct HTTP!');
+    logResult('File written successfully', 'tests/hello.txt');
 
-    // Read the file
-    const content = await fs.readFile('/tests/hello.txt');
-    console.log('File content:', new TextDecoder().decode(content));
+    // 读文件
+    const content = await fs.readFile(ensureLeadingSlash('tests/hello.txt'));
+    logResult('File content:', new TextDecoder().decode(content));
 
-    // Check file stats
-    const stats = await fs.stat('/tests/hello.txt');
-    console.log('File stats:', {
+    // 文件 stat
+    const stats = await fs.stat(ensureLeadingSlash('tests/hello.txt'));
+    logResult('File stats:', {
       size: stats.size,
       mode: stats.mode.toString(8),
       mtime: new Date(stats.mtimeMs),
     });
 
-    // Create a directory
-    await fs.mkdir('/tests/subfolder', { uid: 0, gid: 0, mode: 0o755 });
-    console.log('Directory created');
+    // 创建目录
+    await fs.mkdir(ensureLeadingSlash('tests/subfolder'), { uid: 0, gid: 0, mode: 0o755 });
+    logResult('Directory created', 'tests/subfolder');
 
-    // List directory contents
-    const files = await fs.readdir('/tests');
-    console.log('Directory contents:', files);
+    // 目录列表
+    const files = await fs.readdir(ensureLeadingSlash('tests'));
+    logResult('Directory contents:', files);
 
-    // Write a file in the subdirectory
-    await fs.writeFile('/tests/subfolder/nested.txt', 'Nested file content');
-    console.log('Nested file written');
+    // 子目录写文件
+    await fs.writeFile(ensureLeadingSlash('tests/subfolder/nested.txt'), 'Nested file content');
+    logResult('Nested file written', 'tests/subfolder/nested.txt');
 
-    // List subdirectory contents
-    const subFiles = await fs.readdir('/tests/subfolder');
-    console.log('Subdirectory contents:', subFiles);
+    // 子目录列表
+    const subFiles = await fs.readdir(ensureLeadingSlash('tests/subfolder'));
+    logResult('Subdirectory contents:', subFiles);
 
-    // Copy operation (rename)
-    await fs.rename('/tests/hello.txt', '/tests/hello-renamed.txt');
-    console.log('File renamed');
+    // 重命名
+    await fs.rename(ensureLeadingSlash('tests/hello.txt'), ensureLeadingSlash('tests/hello-renamed.txt'));
+    logResult('File renamed', 'tests/hello.txt -> tests/hello-renamed.txt');
 
-    // Verify the rename
-    const exists = await fs.exists('/tests/hello-renamed.txt');
-    console.log('Renamed file exists:', exists);
+    // 校验重命名
+    const exists = await fs.exists(ensureLeadingSlash('tests/hello-renamed.txt'));
+    logResult('Renamed file exists:', exists);
 
-    // Write binary data
-    const binaryData = new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f]); // "Hello"
-    await fs.writeFile('/tests/binary.bin', binaryData);
-    console.log('Binary file written');
+    // 写二进制
+    const binaryData = new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f]);
+    await fs.writeFile(ensureLeadingSlash('tests/binary.bin'), binaryData);
+    logResult('Binary file written', 'tests/binary.bin');
 
-    // Read binary data
-    const binaryContent = await fs.readFile('/tests/binary.bin');
-    console.log('Binary file content:', Array.from(binaryContent));
+    // 读二进制
+    const binaryContent = await fs.readFile(ensureLeadingSlash('tests/binary.bin'));
+    logResult('Binary file content:', Array.from(binaryContent));
 
-    // Clean up
-    await fs.unlink('/tests/hello-renamed.txt');
-    await fs.unlink('/tests/binary.bin');
-    await fs.unlink('/tests/subfolder/nested.txt');
-    await fs.rmdir('/tests/subfolder');
-    console.log('Cleanup completed');
+    // 清理
+    await safeUnlink(fs, ensureLeadingSlash('tests/hello-renamed.txt'));
+    await safeUnlink(fs, ensureLeadingSlash('tests/binary.bin'));
+    await safeUnlink(fs, ensureLeadingSlash('tests/subfolder/nested.txt'));
+    await safeRmdir(fs, ensureLeadingSlash('tests/subfolder'));
+    logResult('Cleanup completed', '');
 
-    // Disconnect (not needed for HTTP implementation but good practice)
+    // 断开连接
     await fs.disconnect();
-    console.log('Disconnected from RemoteStorage');
+    logResult('Disconnected from RemoteStorage', '');
 
   } catch (error) {
-    console.error('Error:', error);
+    logResult('Error:', error);
     if (error instanceof Error) {
-      console.error('Error details:', error.message);
-      console.error('Error stack:', error.stack);
+      logResult('Error details:', error.message);
+      logResult('Error stack:', error.stack);
     }
   }
 }

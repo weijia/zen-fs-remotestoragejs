@@ -1,6 +1,6 @@
 {
   "name": "zen-fs-remotestoragejs",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "type": "module",
   "description": "RemoteStorage.js backend for zen-fs - distributed file system interface",
   "main": "dist/index.cjs",
@@ -45,12 +45,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/weijia/zen-fs-remotestoragejs.git"
+    "url": "https://github.com/weijia/zen-fs-remotestorage.git"
   },
   "bugs": {
-    "url": "https://github.com/weijia/zen-fs-remotestoragejs/issues"
+    "url": "https://github.com/weijia/zen-fs-remotestorage/issues"
   },
-  "homepage": "https://github.com/weijia/zen-fs-remotestoragejs#readme",
+  "homepage": "https://github.com/weijia/zen-fs-remotestorage#readme",
   "engines": {
     "node": ">=18.0.0"
   },

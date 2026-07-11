@@ -45,12 +45,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/weijia/zen-fs-remotestorage.git"
+    "url": "https://github.com/weijia/zen-fs-remotestoragejs.git"
   },
   "bugs": {
-    "url": "https://github.com/weijia/zen-fs-remotestorage/issues"
+    "url": "https://github.com/weijia/zen-fs-remotestoragejs/issues"
   },
-  "homepage": "https://github.com/weijia/zen-fs-remotestorage#readme",
+  "homepage": "https://github.com/weijia/zen-fs-remotestoragejs#readme",
   "engines": {
     "node": ">=18.0.0"
   },

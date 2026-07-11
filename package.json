@@ -1,16 +1,16 @@
 {
   "name": "zen-fs-remotestoragejs",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "type": "module",
   "description": "RemoteStorage.js backend for zen-fs - distributed file system interface",
-  "main": "dist/index.js",
-  "module": "dist/index.mjs",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
     }
   },
   "files": [
@@ -45,23 +45,23 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourusername/zen-fs-remotestoragejs.git"
+    "url": "https://github.com/weijia/zen-fs-remotestoragejs.git"
   },
   "bugs": {
-    "url": "https://github.com/yourusername/zen-fs-remotestoragejs/issues"
+    "url": "https://github.com/weijia/zen-fs-remotestoragejs/issues"
   },
-  "homepage": "https://github.com/yourusername/zen-fs-remotestoragejs#readme",
+  "homepage": "https://github.com/weijia/zen-fs-remotestoragejs#readme",
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "@zenfs/core": "^2.3.3",
-    "express": "^5.1.0",
-    "open": "^10.2.0"
+    "@zenfs/core": "^2.3.3"
   },
   "devDependencies": {
     "@types/express": "^5.0.3",
     "@types/node": "^24.0.12",
+    "express": "^5.1.0",
+    "open": "^10.2.0",
     "@typescript-eslint/eslint-plugin": "^8.36.0",
     "@typescript-eslint/parser": "^8.36.0",
     "@vitest/ui": "^3.2.4",

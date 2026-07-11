@@ -276,19 +276,18 @@ export class RemoteStorageFileSystem extends FileSystem {
     path = this.validateAndNormalizePath(path, true);
     const dirUrl = this.buildUrl(path);
     try {
-      const response = await this.makeRequest(dirUrl, { 
+      const response = await this.makeRequest(dirUrl, {
         method: 'GET',
-        headers: {
-          'Accept': 'application/ld+json',
-        },
+        headers: { 'Accept': 'application/ld+json' },
       });
       if (!response.ok) {
         this.handleHttpError(response, path, 'readdir');
       }
       const contentType = response.headers.get('content-type') || '';
+      let items: string[];
       if (contentType.includes('application/ld+json')) {
         const listing = await response.json();
-        const items: string[] = [];
+        items = [];
         if (listing['@graph']) {
           for (const item of listing['@graph']) {
             if (item['@id'] && item['@id'] !== './') {
@@ -299,17 +298,17 @@ export class RemoteStorageFileSystem extends FileSystem {
             }
           }
         } else if (listing['items'] && typeof listing['items'] === 'object') {
-          for (const key of Object.keys(listing['items'])) {
-            if (key && key !== './') {
-              items.push(key.replace(/\/$/, ''));
+          for (const entryKey of Object.keys(listing['items'])) {
+            if (entryKey && entryKey !== './') {
+              items.push(entryKey.replace(/\/$/, ''));
             }
           }
         }
-        return items;
       } else {
         const html = await response.text();
-        return this.parseHtmlDirectoryListing(html);
+        items = this.parseHtmlDirectoryListing(html);
       }
+      return items;
     } catch (error) {
       if (error instanceof DirectoryNotFoundError || error instanceof RemoteStorageError) {
         throw error;
@@ -641,11 +640,10 @@ export class RemoteStorageFileSystem extends FileSystem {
     }
 
     const url = this.buildUrl(path);
-    
     try {
       // Try HEAD request to get metadata
       const response = await this.makeRequest(url, { method: 'HEAD' });
-      
+
       if (!response.ok) {
         this.handleHttpError(response, path, 'stat');
       }
@@ -656,10 +654,10 @@ export class RemoteStorageFileSystem extends FileSystem {
 
       // Check if it's a directory by trying to list it
       const isDirectory = await this.isDirectory(path);
-      
+
       const size = contentLength ? parseInt(contentLength, 10) : 0;
       const mtime = lastModified ? new Date(lastModified).getTime() : Date.now();
-      
+
       return {
         ino: 0,
         mode: isDirectory ? 0o040755 : 0o100644,
@@ -679,6 +677,72 @@ export class RemoteStorageFileSystem extends FileSystem {
       throw new RemoteStorageError(
         `Failed to stat ${path}: ${error instanceof Error ? error.message : String(error)}`
       );
+    }
+  }
+
+  /**
+   * Freshness-aware file read used by `zen-fs-cache`.
+   *
+   * Performs a conditional `GET` when validators are supplied, returning
+   * `304` (no body) when the content is unchanged so the cache can serve the
+   * previously stored bytes. The response's `ETag` / `Last-Modified` are
+   * surfaced so the cache can re-validate on the next read.
+   */
+  async readFileMeta(
+    path: string,
+    opts?: { ifNoneMatch?: string; ifModifiedSince?: string },
+  ): Promise<{ status: number; data?: Uint8Array; etag?: string; lastModified?: string; contentType?: string }> {
+    path = this.validateAndNormalizePath(path);
+    const url = this.buildUrl(path);
+    const headers: Record<string, string> = {};
+    if (opts?.ifNoneMatch) headers['If-None-Match'] = opts.ifNoneMatch;
+    else if (opts?.ifModifiedSince) headers['If-Modified-Since'] = opts.ifModifiedSince;
+
+    try {
+      const response = await this.makeRequest(url, { method: 'GET', headers });
+      if (response.status === 304) {
+        return {
+          status: 304,
+          etag: response.headers.get('ETag') ?? opts?.ifNoneMatch,
+          lastModified: response.headers.get('Last-Modified') ?? opts?.ifModifiedSince,
+        };
+      }
+      if (!response.ok) {
+        this.handleHttpError(response, path, 'readFileMeta');
+      }
+      const data = new Uint8Array(await response.arrayBuffer());
+      return {
+        status: 200,
+        data,
+        etag: response.headers.get('ETag') ?? undefined,
+        lastModified: response.headers.get('Last-Modified') ?? undefined,
+        contentType: response.headers.get('Content-Type') ?? undefined,
+      };
+    } catch (error) {
+      if (error instanceof FileNotFoundError || error instanceof RemoteStorageError) {
+        throw error;
+      }
+      throw new RemoteStorageError(
+        `Failed to read file meta ${path}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  /**
+   * Return a revision token for any path (file or directory). Used by
+   * `zen-fs-cache` for cheap revalidation of `readdir` / `stat` and as a
+   * fallback for `readFile`. Prefers the `ETag`, falling back to
+   * `Last-Modified` (HTTP-date string).
+   */
+  async getRevision(path: string): Promise<string | number | undefined> {
+    path = this.validateAndNormalizePath(path);
+    const url = this.buildUrl(path);
+    try {
+      const response = await this.makeRequest(url, { method: 'HEAD' });
+      if (!response.ok) return undefined;
+      return response.headers.get('ETag') ?? response.headers.get('Last-Modified') ?? undefined;
+    } catch {
+      return undefined;
     }
   }
 

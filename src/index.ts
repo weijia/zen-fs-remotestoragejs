@@ -34,6 +34,11 @@ export {
   isValidPath,
   joinPath,
 } from './utils.js';
+export {
+  createUniversalSyncFileSystem,
+  adaptFileSystem,
+} from './universal-sync.js';
+export type { UniversalSyncFileSystem } from './universal-sync.js';
 
 import { RemoteStorageFileSystem } from './RemoteStorageFileSystem.js';
 import type { RemoteStorageConfig } from './types.js';

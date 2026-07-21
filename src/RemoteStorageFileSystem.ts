@@ -60,6 +60,13 @@ export class RemoteStorageFileSystem extends FileSystem {
     // Normalize base URL
     this.baseUrl = config.href.endsWith('/') ? config.href.slice(0, -1) : config.href;
     
+    // Normalize basePath: ensure leading '/' and trailing '/'
+    // RemoteStorage spec requires directory URLs to end with '/'
+    let bp = config.basePath || '';
+    if (bp && !bp.startsWith('/')) bp = '/' + bp;
+    if (bp && !bp.endsWith('/')) bp = bp + '/';
+    this.config = { ...config, basePath: bp };
+    
     // Set up headers
     this.headers = new Headers({
       'Authorization': `Bearer ${config.token}`,
@@ -76,7 +83,12 @@ export class RemoteStorageFileSystem extends FileSystem {
   private buildUrl(path: string): string {
     const basePath = this.config.basePath || '';
     const normalizedPath = normalizePath(path);
-    const fullPath = basePath + (normalizedPath ? '/' + normalizedPath : '');
+    // RemoteStorage spec: directory URLs must end with '/'
+    const isDir = path === '/' || path.endsWith('/');
+    const suffix = normalizedPath
+      ? '/' + normalizedPath
+      : (isDir ? '/' : '');
+    const fullPath = basePath + suffix;
     return this.baseUrl + fullPath;
   }
 
@@ -281,6 +293,10 @@ export class RemoteStorageFileSystem extends FileSystem {
         headers: { 'Accept': 'application/ld+json' },
       });
       if (!response.ok) {
+        // Remote directory not found = empty directory, return []
+        if (response.status === 404) {
+          return [];
+        }
         this.handleHttpError(response, path, 'readdir');
       }
       const contentType = response.headers.get('content-type') || '';

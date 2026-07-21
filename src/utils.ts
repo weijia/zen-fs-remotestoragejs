@@ -16,8 +16,9 @@ export function normalizePath(path: string): string {
   }
   
   // Remove trailing slash unless it's the root
-  // if (path.endsWith('/') && path.length > 1) {
-  //   path = path.slice(0, -1);
+  if (path.endsWith('/')) {
+    path = path.slice(0, -1);
+  }
   // }
   
   return path;

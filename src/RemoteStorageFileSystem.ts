@@ -88,7 +88,10 @@ export class RemoteStorageFileSystem extends FileSystem {
     const suffix = normalizedPath
       ? '/' + normalizedPath
       : (isDir ? '/' : '');
-    const fullPath = basePath + suffix;
+    // Avoid double slashes when basePath ends with '/' and suffix starts with '/'
+    const fullPath = basePath.endsWith('/') && suffix.startsWith('/')
+      ? basePath + suffix.slice(1)
+      : basePath + suffix;
     return this.baseUrl + fullPath;
   }
 

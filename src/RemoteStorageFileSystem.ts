@@ -53,10 +53,14 @@ export class RemoteStorageFileSystem extends FileSystem {
   private baseUrl: string;
   private headers: Headers;
   private timeout: number;
+  readonly backendName: string;
 
   constructor(private config: RemoteStorageConfig) {
     super(0 as any, 0 as any); // FileSystem constructor - using type assertion for now
     
+    // Set backend name for zen-fs-sync logging
+    this.backendName = `RemoteStorage@${config.href.replace(/^https?:\/\//, '')}`;
+
     // Normalize base URL
     this.baseUrl = config.href.endsWith('/') ? config.href.slice(0, -1) : config.href;
     
@@ -227,6 +231,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       }
     }
     const url = this.buildUrl(path);
+    console.log(`[RemoteStorage] writeFile path=${path} url=${url} size=${typeof data === 'string' ? data.length : (data as Uint8Array).byteLength}`);
     try {
       // 直接写文件，不自动创建父目录
       let body: BodyInit;

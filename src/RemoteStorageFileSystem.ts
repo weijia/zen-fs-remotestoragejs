@@ -24,6 +24,7 @@ import {
   isValidPath,
   joinPath,
 } from './utils.js';
+import { rsLog, rsLogResult } from './debug.js';
 
 /**
  * RemoteStorage filesystem implementation for zen-fs using direct HTTP requests
@@ -87,24 +88,24 @@ export class RemoteStorageFileSystem extends FileSystem {
   private buildUrl(path: string): string {
     const basePath = this.config.basePath || '';
     const normalizedPath = normalizePath(path);
-    // RemoteStorage spec: directory URLs must end with '/'
-    // normalizePath strips the trailing slash, so we restore it here
-    // based on the caller's intent (trailing slash = directory).
     const isDir = path === '/' || path.endsWith('/');
     const suffix = normalizedPath
       ? '/' + normalizedPath + (isDir ? '/' : '')
       : (isDir ? '/' : '');
-    // Avoid double slashes when basePath ends with '/' and suffix starts with '/'
     const fullPath = basePath.endsWith('/') && suffix.startsWith('/')
       ? basePath + suffix.slice(1)
       : basePath + suffix;
-    return this.baseUrl + fullPath;
+    const url = this.baseUrl + fullPath;
+    rsLog('buildUrl', path, { isDir, url });
+    return url;
   }
 
   /**
    * Make HTTP request with timeout
    */
   private async makeRequest(url: string, options: RequestInit = {}): Promise<Response> {
+    const method = options.method || 'GET';
+    rsLog('makeRequest', url, { method, attempt: 'start' });
     const maxRetries = 3;
     let lastError: any = null;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -122,11 +123,12 @@ export class RemoteStorageFileSystem extends FileSystem {
           signal: controller.signal,
         });
         clearTimeout(timeoutId);
+        rsLogResult('makeRequest', url, `${method} status=${response.status}`);
         return response;
       } catch (error) {
         clearTimeout(timeoutId);
         lastError = error;
-        // 只对网络错误/超时重试，其他错误直接抛出
+        rsLogResult('makeRequest', url, `${method} attempt=${attempt + 1} error=${error instanceof Error ? error.message : String(error)}`, false);
         if (error instanceof Error && (error.name === 'AbortError' || error.name === 'FetchError' || error.message?.includes('network'))) {
           if (attempt < maxRetries - 1) {
             await new Promise(res => setTimeout(res, 200 * (attempt + 1)));
@@ -139,7 +141,6 @@ export class RemoteStorageFileSystem extends FileSystem {
         throw error;
       }
     }
-    // 如果重试后仍失败，抛出最后的错误
     throw lastError || new RemoteStorageError('Unknown HTTP request error');
   }
 
@@ -186,13 +187,17 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Check if file/directory exists
    */
   async exists(path: string): Promise<boolean> {
+    rsLog('exists', path);
     try {
       await this.stat(path);
+      rsLogResult('exists', path, true);
       return true;
     } catch (error) {
       if (error instanceof FileNotFoundError) {
+        rsLogResult('exists', path, false);
         return false;
       }
+      rsLogResult('exists', path, error, false);
       throw error;
     }
   }
@@ -201,6 +206,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Read file contents
    */
   async readFile(path: string): Promise<Uint8Array> {
+    rsLog('readFile', path);
     path = this.validateAndNormalizePath(path);
     const url = this.buildUrl(path);
     try {
@@ -209,8 +215,11 @@ export class RemoteStorageFileSystem extends FileSystem {
         this.handleHttpError(response, path, 'readFile');
       }
       const arrayBuffer = await response.arrayBuffer();
-      return new Uint8Array(arrayBuffer);
+      const data = new Uint8Array(arrayBuffer);
+      rsLogResult('readFile', path, `size=${data.byteLength}`);
+      return data;
     } catch (error) {
+      rsLogResult('readFile', path, error, false);
       if (error instanceof FileNotFoundError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -224,17 +233,19 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Write file contents
    */
   async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, options?: { flag?: string }): Promise<void> {
+    const size = typeof data === 'string' ? data.length : (data as Uint8Array).byteLength;
+    rsLog('writeFile', path, { flag: options?.flag, size });
     path = this.validateAndNormalizePath(path);
     const flag = options?.flag;
     // Check if file exists for exclusive flags
     if (flag === 'x' || flag === 'wx') {
       const exists = await this.exists(path);
       if (exists) {
+        rsLogResult('writeFile', path, 'FileExistsError', false);
         throw new FileExistsError(path);
       }
     }
     const url = this.buildUrl(path);
-    console.log(`[RemoteStorage] writeFile path=${path} url=${url} size=${typeof data === 'string' ? data.length : (data as Uint8Array).byteLength}`);
     try {
       // 直接写文件，不自动创建父目录
       let body: BodyInit;
@@ -261,7 +272,9 @@ export class RemoteStorageFileSystem extends FileSystem {
       if (!response.ok) {
         this.handleHttpError(response, path, 'writeFile');
       }
+      rsLogResult('writeFile', path, `status=${response.status}`);
     } catch (error) {
+      rsLogResult('writeFile', path, error, false);
       if (error instanceof FileExistsError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -275,6 +288,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Delete file
    */
   async unlink(path: string): Promise<void> {
+    rsLog('unlink', path);
     path = this.validateAndNormalizePath(path);
     try {
       const url = this.buildUrl(path);
@@ -282,7 +296,9 @@ export class RemoteStorageFileSystem extends FileSystem {
       if (!response.ok) {
         this.handleHttpError(response, path, 'unlink');
       }
+      rsLogResult('unlink', path, `status=${response.status}`);
     } catch (error) {
+      rsLogResult('unlink', path, error, false);
       if (error instanceof FileNotFoundError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -296,6 +312,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Read directory contents
    */
   async readdir(path: string): Promise<string[]> {
+    rsLog('readdir', path);
     path = this.validateAndNormalizePath(path, true);
     const dirUrl = this.buildUrl(path);
     try {
@@ -305,6 +322,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       });
       if (!response.ok) {
         if (response.status === 404) {
+          rsLogResult('readdir', path, 'DirectoryNotFoundError', false);
           throw new DirectoryNotFoundError(path);
         }
         this.handleHttpError(response, path, 'readdir');
@@ -334,8 +352,10 @@ export class RemoteStorageFileSystem extends FileSystem {
         const html = await response.text();
         items = this.parseHtmlDirectoryListing(html);
       }
+      rsLogResult('readdir', path, `count=${items.length} [${items.join(', ')}]`);
       return items;
     } catch (error) {
+      rsLogResult('readdir', path, error, false);
       if (error instanceof DirectoryNotFoundError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -373,6 +393,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Create directory
    */
   async mkdir(path: string, options: CreationOptions): Promise<InodeLike> {
+    rsLog('mkdir', path);
     path = this.validateAndNormalizePath(path, true);
     try {
       // 创建占位文件，确保目录可见
@@ -382,7 +403,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       } catch (e) {
         // 占位文件写入失败不影响主流程
       }
-      return {
+      const result = {
         ino: 0,
         mode: options.mode || 0o040755,
         uid: options.uid || 0,
@@ -394,7 +415,10 @@ export class RemoteStorageFileSystem extends FileSystem {
         birthtimeMs: Date.now(),
         nlink: 1,
       };
+      rsLogResult('mkdir', path, `mode=${result.mode.toString(8)}`);
+      return result;
     } catch (error) {
+      rsLogResult('mkdir', path, error, false);
       if (error instanceof FileExistsError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -408,16 +432,19 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Remove directory
    */
   async rmdir(path: string): Promise<void> {
+    rsLog('rmdir', path);
     path = this.validateAndNormalizePath(path, true);
     try {
       // Check if directory exists
       const stats = await this.stat(path);
       if (!this.isDirectoryMode(stats.mode)) {
+        rsLogResult('rmdir', path, 'Not a directory', false);
         throw new RemoteStorageError(`Not a directory: ${path}`);
       }
       // Check directory entries
       const entries = await this.readdir(path);
       if (entries.length > 1 || (entries.length === 1 && entries[0] !== '.keep')) {
+        rsLogResult('rmdir', path, `Directory not empty: [${entries.join(', ')}]`, false);
         throw new RemoteStorageError(`Directory not empty (except .keep): ${path}`);
       }
       // 删除 .keep 占位文件（如果存在）
@@ -425,7 +452,9 @@ export class RemoteStorageFileSystem extends FileSystem {
         const keepFilePath = joinPath(path, '.keep');
         await this.unlink(keepFilePath);
       }
+      rsLogResult('rmdir', path, 'OK');
     } catch (error) {
+      rsLogResult('rmdir', path, error, false);
       if (error instanceof FileNotFoundError || error instanceof DirectoryNotFoundError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -460,7 +489,9 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Rename/move file or directory
    */
   async rename(oldPath: string, newPath: string): Promise<void> {
+    rsLog('rename', oldPath, { to: newPath });
     if (!isValidPath(oldPath) || !isValidPath(newPath)) {
+      rsLogResult('rename', oldPath, 'Invalid path format', false);
       throw new RemoteStorageError('Invalid path format');
     }
 
@@ -470,22 +501,23 @@ export class RemoteStorageFileSystem extends FileSystem {
       // 检查目标是否已存在
       const destExists = await this.exists(newPath);
       if (destExists) {
+        rsLogResult('rename', oldPath, `FileExistsError: ${newPath}`, false);
         throw new FileExistsError(newPath);
       }
 
       if (this.isFileMode(stats.mode)) {
-        // 文件重命名：读内容，写新路径，删旧路径（此处已知 oldPath 一定是文件，无需 unlink 再 stat）
+        // 文件重命名：读内容，写新路径，删旧路径
         const content = await this.readFile(oldPath);
         await this.writeFile(newPath, content);
-        // 写入和删除之间等待一段时间，避免远端同步延迟导致删除失败
-        // await new Promise(resolve => setTimeout(resolve, 1000));
-        await this.unlink(oldPath); // unlink 已优化，无需再 stat
+        await this.unlink(oldPath);
       } else {
         // 目录重命名：递归复制后删除原目录
         await this.copyDirectoryRecursive(oldPath, newPath);
         await this.rmdirRecursive(oldPath);
       }
+      rsLogResult('rename', oldPath, `→ ${newPath}`);
     } catch (error) {
+      rsLogResult('rename', oldPath, error, false);
       if (error instanceof FileNotFoundError || error instanceof FileExistsError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -553,6 +585,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Sync filesystem (no-op for RemoteStorage as it's always synced)
    */
   async sync(): Promise<void> {
+    rsLog('sync', '(root)');
     // RemoteStorage is always synced via HTTP
   }
 
@@ -560,6 +593,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Disconnect and cleanup
    */
   async disconnect(): Promise<void> {
+    rsLog('disconnect', '(root)');
     // Nothing to disconnect for HTTP-based implementation
   }
 
@@ -632,6 +666,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Modify metadata (touch)
    */
   async touch(path: string, metadata: Partial<InodeLike>): Promise<void> {
+    rsLog('touch', path, metadata);
     throw new Error('Touch operation not supported by RemoteStorage');
   }
 
@@ -639,11 +674,9 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Create the file at path with the given options
    */
   async createFile(path: string, options: CreationOptions): Promise<InodeLike> {
-    // Create an empty file
+    rsLog('createFile', path);
     await this.writeFile(path, new Uint8Array(0));
-    
-    // Return the created file inode
-    return {
+    const result = {
       ino: 0,
       mode: options.mode || 0o100644,
       uid: options.uid || 0,
@@ -655,13 +688,17 @@ export class RemoteStorageFileSystem extends FileSystem {
       birthtimeMs: Date.now(),
       nlink: 1,
     };
+    rsLogResult('createFile', path, `mode=${result.mode.toString(8)}`);
+    return result;
   }
 
   /**
    * Get file/directory stat information
    */
   async stat(path: string): Promise<InodeLike> {
+    rsLog('stat', path);
     if (!isValidPath(path)) {
+      rsLogResult('stat', path, 'Invalid path format', false);
       throw new RemoteStorageError('Invalid path format');
     }
 
@@ -682,7 +719,7 @@ export class RemoteStorageFileSystem extends FileSystem {
             const lastModified = response.headers.get('last-modified');
             const size = contentLength ? parseInt(contentLength, 10) : 0;
             const mtime = lastModified ? new Date(lastModified).getTime() : Date.now();
-            return {
+            const result = {
               ino: 0,
               mode: 0o100644,
               uid: 0,
@@ -694,6 +731,8 @@ export class RemoteStorageFileSystem extends FileSystem {
               birthtimeMs: mtime,
               nlink: 1,
             };
+            rsLogResult('stat', path, `FILE mode=${result.mode.toString(8)} size=${size}`);
+            return result;
           }
         }
         // 404 → not a file, try as directory below
@@ -719,6 +758,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       if (response.ok) {
         const contentType = response.headers.get('content-type') || '';
         if (contentType.includes('application/ld+json') || contentType.includes('text/html')) {
+          rsLogResult('stat', path, `DIR mode=40755`);
           return {
             ino: 0,
             mode: 0o040755,
@@ -734,10 +774,12 @@ export class RemoteStorageFileSystem extends FileSystem {
         }
       }
       if (response.status === 404) {
+        rsLogResult('stat', path, 'FileNotFoundError', false);
         throw new FileNotFoundError(path);
       }
       this.handleHttpError(response, path, 'stat');
     } catch (error) {
+      rsLogResult('stat', path, error, false);
       if (error instanceof FileNotFoundError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -747,6 +789,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     }
 
     // Should not reach here
+    rsLogResult('stat', path, 'FileNotFoundError', false);
     throw new FileNotFoundError(path);
   }
 
@@ -762,6 +805,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     path: string,
     opts?: { ifNoneMatch?: string; ifModifiedSince?: string },
   ): Promise<{ status: number; data?: Uint8Array; etag?: string; lastModified?: string; contentType?: string }> {
+    rsLog('readFileMeta', path, opts);
     path = this.validateAndNormalizePath(path);
     const url = this.buildUrl(path);
     const headers: Record<string, string> = {};
@@ -771,6 +815,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     try {
       const response = await this.makeRequest(url, { method: 'GET', headers });
       if (response.status === 304) {
+        rsLogResult('readFileMeta', path, '304 Not Modified');
         return {
           status: 304,
           etag: response.headers.get('ETag') ?? opts?.ifNoneMatch,
@@ -781,6 +826,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         this.handleHttpError(response, path, 'readFileMeta');
       }
       const data = new Uint8Array(await response.arrayBuffer());
+      rsLogResult('readFileMeta', path, `200 size=${data.byteLength}`);
       return {
         status: 200,
         data,
@@ -789,6 +835,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         contentType: response.headers.get('Content-Type') ?? undefined,
       };
     } catch (error) {
+      rsLogResult('readFileMeta', path, error, false);
       if (error instanceof FileNotFoundError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -805,13 +852,20 @@ export class RemoteStorageFileSystem extends FileSystem {
    * `Last-Modified` (HTTP-date string).
    */
   async getRevision(path: string): Promise<string | number | undefined> {
+    rsLog('getRevision', path);
     path = this.validateAndNormalizePath(path);
     const url = this.buildUrl(path);
     try {
       const response = await this.makeRequest(url, { method: 'HEAD' });
-      if (!response.ok) return undefined;
-      return response.headers.get('ETag') ?? response.headers.get('Last-Modified') ?? undefined;
-    } catch {
+      if (!response.ok) {
+        rsLogResult('getRevision', path, `status=${response.status}`);
+        return undefined;
+      }
+      const rev = response.headers.get('ETag') ?? response.headers.get('Last-Modified') ?? undefined;
+      rsLogResult('getRevision', path, rev);
+      return rev;
+    } catch (err) {
+      rsLogResult('getRevision', path, err, false);
       return undefined;
     }
   }
@@ -820,6 +874,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Hard link operation (not supported)
    */
   async link(target: string, link: string): Promise<void> {
+    rsLog('link', target, { link });
     throw new Error('Link operation not supported by RemoteStorage');
   }
 
@@ -827,19 +882,21 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Read into a buffer
    */
   async read(path: string, buffer: Uint8Array, start: number, end: number): Promise<void> {
+    rsLog('read', path, { start, end, bufLen: buffer.length });
     const data = await this.readFile(path);
     const slice = data.slice(start, end);
     buffer.set(slice, 0);
+    rsLogResult('read', path, `copied=${slice.length}`);
   }
 
   /**
    * Write a buffer to a file
    */
   async write(path: string, buffer: Uint8Array, offset: number): Promise<void> {
+    rsLog('write', path, { offset, len: buffer.length });
     // For simplicity, we'll read the entire file, modify it, and write it back
-    // This is not efficient for large files but works for the RemoteStorage use case
     let existingData: Uint8Array;
-    
+
     try {
       existingData = await this.readFile(path);
     } catch (error) {
@@ -853,14 +910,15 @@ export class RemoteStorageFileSystem extends FileSystem {
     // Extend the file if necessary
     const newSize = Math.max(existingData.length, offset + buffer.length);
     const newData = new Uint8Array(newSize);
-    
+
     // Copy existing data
     newData.set(existingData);
-    
+
     // Write new data at offset
     newData.set(buffer, offset);
-    
+
     await this.writeFile(path, newData);
+    rsLogResult('write', path, `newSize=${newSize}`);
   }
 
   /**

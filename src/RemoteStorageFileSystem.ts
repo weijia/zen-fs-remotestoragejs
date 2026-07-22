@@ -663,46 +663,40 @@ export class RemoteStorageFileSystem extends FileSystem {
       throw new RemoteStorageError('Invalid path format');
     }
 
-    // RemoteStorage requires directory URLs to end with '/'.
-    // The caller may pass '/.meta' without trailing slash, so we need
-    // to try the directory URL first, then fall back to file URL.
-    const dirUrl = this.buildUrl(path.endsWith('/') ? path : path + '/');
-    const fileUrl = this.buildUrl(path);
-
+    // RemoteStorage servers require directory URLs to end with '/'.
+    // Callers (e.g. zen-fs-sync) pass paths without trailing slash.
+    // We detect directory vs file here so the caller never needs to care.
     try {
-      // Try HEAD on directory URL first
-      let response = await this.makeRequest(dirUrl, { method: 'HEAD' });
-
-      if (response.ok) {
-        const contentType = response.headers.get('content-type') || '';
-        if (contentType.includes('application/ld+json') || contentType.includes('text/html')) {
-          // It's a directory
-          return {
-            ino: 0,
-            mode: 0o040755,
-            uid: 0,
-            gid: 0,
-            size: 0,
-            mtimeMs: Date.now(),
-            ctimeMs: Date.now(),
-            atimeMs: Date.now(),
-            birthtimeMs: Date.now(),
-            nlink: 1,
-          };
-        }
+      const entries = await this.readdir(path);
+      if (entries.length >= 0) {
+        // readdir succeeded → it's a directory
+        return {
+          ino: 0,
+          mode: 0o040755,
+          uid: 0,
+          gid: 0,
+          size: 0,
+          mtimeMs: Date.now(),
+          ctimeMs: Date.now(),
+          atimeMs: Date.now(),
+          birthtimeMs: Date.now(),
+          nlink: 1,
+        };
       }
+    } catch {
+      // Not a directory, try as file
+    }
 
-      // Try HEAD on file URL
-      response = await this.makeRequest(fileUrl, { method: 'HEAD' });
-
+    // Try as file
+    const url = this.buildUrl(path);
+    try {
+      const response = await this.makeRequest(url, { method: 'HEAD' });
       if (!response.ok) {
         this.handleHttpError(response, path, 'stat');
       }
 
-      const contentType = response.headers.get('content-type') || '';
       const contentLength = response.headers.get('content-length');
       const lastModified = response.headers.get('last-modified');
-
       const size = contentLength ? parseInt(contentLength, 10) : 0;
       const mtime = lastModified ? new Date(lastModified).getTime() : Date.now();
 

@@ -1,6 +1,6 @@
 {
   "name": "zen-fs-remotestoragejs",
-  "version": "1.2.7",
+  "version": "1.2.8",
   "type": "module",
   "description": "RemoteStorage.js backend for zen-fs - distributed file system interface",
   "main": "dist/index.cjs",

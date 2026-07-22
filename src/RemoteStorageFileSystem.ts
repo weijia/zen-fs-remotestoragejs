@@ -304,9 +304,8 @@ export class RemoteStorageFileSystem extends FileSystem {
         headers: { 'Accept': 'application/ld+json' },
       });
       if (!response.ok) {
-        // Remote directory not found = empty directory, return []
         if (response.status === 404) {
-          return [];
+          throw new DirectoryNotFoundError(path);
         }
         this.handleHttpError(response, path, 'readdir');
       }
@@ -666,55 +665,78 @@ export class RemoteStorageFileSystem extends FileSystem {
       throw new RemoteStorageError('Invalid path format');
     }
 
-    // RemoteStorage servers require directory URLs to end with '/'.
-    // Callers (e.g. zen-fs-sync) pass paths without trailing slash.
-    // We detect directory vs file here so the caller never needs to care.
-    try {
-      const entries = await this.readdir(path);
-      if (entries.length >= 0) {
-        // readdir succeeded → it's a directory
-        return {
-          ino: 0,
-          mode: 0o040755,
-          uid: 0,
-          gid: 0,
-          size: 0,
-          mtimeMs: Date.now(),
-          ctimeMs: Date.now(),
-          atimeMs: Date.now(),
-          birthtimeMs: Date.now(),
-          nlink: 1,
-        };
+    // If the caller explicitly passes a trailing slash, they already know
+    // it's a directory — skip the file probe entirely.
+    const callerSaysDir = path.endsWith('/');
+
+    if (!callerSaysDir) {
+      // Try as file first (most common case) — no trailing slash
+      const fileUrl = this.buildUrl(path);
+      try {
+        const response = await this.makeRequest(fileUrl, { method: 'HEAD' });
+        if (response.ok) {
+          const contentType = response.headers.get('content-type') || '';
+          // If HEAD returns a directory content-type, don't treat it as a file
+          if (!contentType.includes('application/ld+json') && !contentType.includes('text/html')) {
+            const contentLength = response.headers.get('content-length');
+            const lastModified = response.headers.get('last-modified');
+            const size = contentLength ? parseInt(contentLength, 10) : 0;
+            const mtime = lastModified ? new Date(lastModified).getTime() : Date.now();
+            return {
+              ino: 0,
+              mode: 0o100644,
+              uid: 0,
+              gid: 0,
+              size,
+              mtimeMs: mtime,
+              ctimeMs: mtime,
+              atimeMs: mtime,
+              birthtimeMs: mtime,
+              nlink: 1,
+            };
+          }
+        }
+        // 404 → not a file, try as directory below
+        if (response.status !== 404) {
+          this.handleHttpError(response, path, 'stat');
+        }
+      } catch (error) {
+        if (error instanceof RemoteStorageError && !(error instanceof FileNotFoundError)) {
+          throw error;
+        }
+        // FileNotFoundError or network error → try as directory
       }
-    } catch {
-      // Not a directory, try as file
     }
 
-    // Try as file
-    const url = this.buildUrl(path);
+    // Try as directory — trailing slash required by RemoteStorage spec
+    const dirPath = path.endsWith('/') ? path : path + '/';
+    const dirUrl = this.buildUrl(dirPath);
     try {
-      const response = await this.makeRequest(url, { method: 'HEAD' });
-      if (!response.ok) {
-        this.handleHttpError(response, path, 'stat');
+      const response = await this.makeRequest(dirUrl, {
+        method: 'GET',
+        headers: { 'Accept': 'application/ld+json' },
+      });
+      if (response.ok) {
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/ld+json') || contentType.includes('text/html')) {
+          return {
+            ino: 0,
+            mode: 0o040755,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtimeMs: Date.now(),
+            ctimeMs: Date.now(),
+            atimeMs: Date.now(),
+            birthtimeMs: Date.now(),
+            nlink: 1,
+          };
+        }
       }
-
-      const contentLength = response.headers.get('content-length');
-      const lastModified = response.headers.get('last-modified');
-      const size = contentLength ? parseInt(contentLength, 10) : 0;
-      const mtime = lastModified ? new Date(lastModified).getTime() : Date.now();
-
-      return {
-        ino: 0,
-        mode: 0o100644,
-        uid: 0,
-        gid: 0,
-        size,
-        mtimeMs: mtime,
-        ctimeMs: mtime,
-        atimeMs: mtime,
-        birthtimeMs: mtime,
-        nlink: 1,
-      };
+      if (response.status === 404) {
+        throw new FileNotFoundError(path);
+      }
+      this.handleHttpError(response, path, 'stat');
     } catch (error) {
       if (error instanceof FileNotFoundError || error instanceof RemoteStorageError) {
         throw error;
@@ -723,6 +745,9 @@ export class RemoteStorageFileSystem extends FileSystem {
         `Failed to stat ${path}: ${error instanceof Error ? error.message : String(error)}`
       );
     }
+
+    // Should not reach here
+    throw new FileNotFoundError(path);
   }
 
   /**

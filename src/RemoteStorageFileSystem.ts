@@ -658,10 +658,37 @@ export class RemoteStorageFileSystem extends FileSystem {
       throw new RemoteStorageError('Invalid path format');
     }
 
-    const url = this.buildUrl(path);
+    // RemoteStorage requires directory URLs to end with '/'.
+    // The caller may pass '/.meta' without trailing slash, so we need
+    // to try the directory URL first, then fall back to file URL.
+    const dirUrl = this.buildUrl(path.endsWith('/') ? path : path + '/');
+    const fileUrl = this.buildUrl(path);
+
     try {
-      // Try HEAD request to get metadata
-      const response = await this.makeRequest(url, { method: 'HEAD' });
+      // Try HEAD on directory URL first
+      let response = await this.makeRequest(dirUrl, { method: 'HEAD' });
+
+      if (response.ok) {
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/ld+json') || contentType.includes('text/html')) {
+          // It's a directory
+          return {
+            ino: 0,
+            mode: 0o040755,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtimeMs: Date.now(),
+            ctimeMs: Date.now(),
+            atimeMs: Date.now(),
+            birthtimeMs: Date.now(),
+            nlink: 1,
+          };
+        }
+      }
+
+      // Try HEAD on file URL
+      response = await this.makeRequest(fileUrl, { method: 'HEAD' });
 
       if (!response.ok) {
         this.handleHttpError(response, path, 'stat');
@@ -671,15 +698,12 @@ export class RemoteStorageFileSystem extends FileSystem {
       const contentLength = response.headers.get('content-length');
       const lastModified = response.headers.get('last-modified');
 
-      // Check if it's a directory by trying to list it
-      const isDirectory = await this.isDirectory(path);
-
       const size = contentLength ? parseInt(contentLength, 10) : 0;
       const mtime = lastModified ? new Date(lastModified).getTime() : Date.now();
 
       return {
         ino: 0,
-        mode: isDirectory ? 0o040755 : 0o100644,
+        mode: 0o100644,
         uid: 0,
         gid: 0,
         size,

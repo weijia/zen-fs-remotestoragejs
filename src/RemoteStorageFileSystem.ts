@@ -88,9 +88,11 @@ export class RemoteStorageFileSystem extends FileSystem {
     const basePath = this.config.basePath || '';
     const normalizedPath = normalizePath(path);
     // RemoteStorage spec: directory URLs must end with '/'
+    // normalizePath strips the trailing slash, so we restore it here
+    // based on the caller's intent (trailing slash = directory).
     const isDir = path === '/' || path.endsWith('/');
     const suffix = normalizedPath
-      ? '/' + normalizedPath
+      ? '/' + normalizedPath + (isDir ? '/' : '')
       : (isDir ? '/' : '');
     // Avoid double slashes when basePath ends with '/' and suffix starts with '/'
     const fullPath = basePath.endsWith('/') && suffix.startsWith('/')
@@ -165,8 +167,9 @@ export class RemoteStorageFileSystem extends FileSystem {
    */
   private async isDirectory(path: string): Promise<boolean> {
     try {
-      // 只对目录路径加/，文件路径保持原样
-      const dirUrl = this.buildUrl(path);
+      // Ensure trailing slash so buildUrl generates a directory URL
+      const dirPath = path.endsWith('/') ? path : path + '/';
+      const dirUrl = this.buildUrl(dirPath);
       const response = await this.makeRequest(dirUrl, { method: 'GET' });
 
       if (response.ok) {

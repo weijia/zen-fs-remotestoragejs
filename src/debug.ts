@@ -14,6 +14,7 @@ function truncate(data: unknown, max = 200): string {
   } catch {
     s = String(data);
   }
+  if (s === undefined) s = 'undefined';
   if (s.length > max) return s.slice(0, max) + '...';
   return s;
 }

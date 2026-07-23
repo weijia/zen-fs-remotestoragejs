@@ -422,7 +422,7 @@ export class RemoteStorageFileSystem extends FileSystem {
   /**
    * Create directory
    */
-  async mkdir(path: string, options: CreationOptions): Promise<InodeLike> {
+  async mkdir(path: string, options?: CreationOptions): Promise<InodeLike> {
     rsLog('mkdir', path);
     path = this.validateAndNormalizePath(path, true);
     try {
@@ -435,9 +435,9 @@ export class RemoteStorageFileSystem extends FileSystem {
       }
       const result = {
         ino: 0,
-        mode: options.mode || 0o040755,
-        uid: options.uid || 0,
-        gid: options.gid || 0,
+        mode: options?.mode || 0o040755,
+        uid: options?.uid || 0,
+        gid: options?.gid || 0,
         size: 0,
         mtimeMs: Date.now(),
         ctimeMs: Date.now(),

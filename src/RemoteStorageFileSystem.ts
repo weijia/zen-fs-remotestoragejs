@@ -56,6 +56,15 @@ export class RemoteStorageFileSystem extends FileSystem {
   private timeout: number;
   readonly backendName: string;
 
+  /**
+   * Existence cache to avoid repeated HEAD/GET requests for the same path.
+   * - `true`  = confirmed to exist (valid until invalidated by mutations)
+   * - `false` = confirmed missing (with TTL to allow re-checking after writes)
+   * - `undefined` = unknown, needs network check
+   */
+  private existenceCache = new Map<string, { exists: boolean; ts: number }>();
+  private static readonly NEGATIVE_CACHE_TTL = 15_000; // 15s for negative results
+
   constructor(private config: RemoteStorageConfig) {
     super(0 as any, 0 as any); // FileSystem constructor - using type assertion for now
     
@@ -188,12 +197,30 @@ export class RemoteStorageFileSystem extends FileSystem {
    */
   async exists(path: string): Promise<boolean> {
     rsLog('exists', path);
+
+    // Check cache first
+    const normalized = normalizePath(path);
+    const cached = this.existenceCache.get(normalized);
+    if (cached) {
+      if (cached.exists) {
+        rsLogResult('exists', path, true, true);
+        return true;
+      }
+      // Negative result: respect TTL
+      if (Date.now() - cached.ts < RemoteStorageFileSystem.NEGATIVE_CACHE_TTL) {
+        rsLogResult('exists', path, false, true);
+        return false;
+      }
+    }
+
     try {
       await this.stat(path);
+      this.existenceCache.set(normalized, { exists: true, ts: Date.now() });
       rsLogResult('exists', path, true);
       return true;
     } catch (error) {
       if (error instanceof FileNotFoundError) {
+        this.existenceCache.set(normalized, { exists: false, ts: Date.now() });
         rsLogResult('exists', path, false);
         return false;
       }
@@ -273,6 +300,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         this.handleHttpError(response, path, 'writeFile');
       }
       rsLogResult('writeFile', path, `status=${response.status}`);
+      this.invalidateExistenceCache(path);
     } catch (error) {
       rsLogResult('writeFile', path, error, false);
       if (error instanceof FileExistsError || error instanceof RemoteStorageError) {
@@ -297,6 +325,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         this.handleHttpError(response, path, 'unlink');
       }
       rsLogResult('unlink', path, `status=${response.status}`);
+      this.removeFromExistenceCache(path);
     } catch (error) {
       rsLogResult('unlink', path, error, false);
       if (error instanceof FileNotFoundError || error instanceof RemoteStorageError) {
@@ -353,6 +382,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         items = this.parseHtmlDirectoryListing(html);
       }
       rsLogResult('readdir', path, `count=${items.length} [${items.join(', ')}]`);
+      this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
       return items;
     } catch (error) {
       rsLogResult('readdir', path, error, false);
@@ -416,6 +446,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         nlink: 1,
       };
       rsLogResult('mkdir', path, `mode=${result.mode.toString(8)}`);
+      this.invalidateExistenceCache(path);
       return result;
     } catch (error) {
       rsLogResult('mkdir', path, error, false);
@@ -453,6 +484,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         await this.unlink(keepFilePath);
       }
       rsLogResult('rmdir', path, 'OK');
+      this.removeFromExistenceCache(path);
     } catch (error) {
       rsLogResult('rmdir', path, error, false);
       if (error instanceof FileNotFoundError || error instanceof DirectoryNotFoundError || error instanceof RemoteStorageError) {
@@ -689,6 +721,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       nlink: 1,
     };
     rsLogResult('createFile', path, `mode=${result.mode.toString(8)}`);
+    this.invalidateExistenceCache(path);
     return result;
   }
 
@@ -732,6 +765,7 @@ export class RemoteStorageFileSystem extends FileSystem {
               nlink: 1,
             };
             rsLogResult('stat', path, `FILE mode=${result.mode.toString(8)} size=${size}`);
+            this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
             return result;
           }
         }
@@ -759,6 +793,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         const contentType = response.headers.get('content-type') || '';
         if (contentType.includes('application/ld+json') || contentType.includes('text/html')) {
           rsLogResult('stat', path, `DIR mode=40755`);
+          this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
           return {
             ino: 0,
             mode: 0o040755,
@@ -950,5 +985,35 @@ export class RemoteStorageFileSystem extends FileSystem {
 
   writeSync(): never {
     throw new Error('Synchronous operations not supported by RemoteStorage');
+  }
+
+  /**
+   * Invalidate existence cache for a path and all its ancestors.
+   * Called after writes, creates, and deletes.
+   */
+  private invalidateExistenceCache(path: string): void {
+    const normalized = normalizePath(path);
+    this.existenceCache.delete(normalized);
+    // Also invalidate the parent directory (readdir results may change)
+    this.existenceCache.delete(ensureDirectoryPath(getParentPath(normalized)));
+    // Mark the path itself as existing (it was just written/created)
+    this.existenceCache.set(normalized, { exists: true, ts: Date.now() });
+  }
+
+  /**
+   * Remove a path from the existence cache (after deletion).
+   */
+  private removeFromExistenceCache(path: string): void {
+    const normalized = normalizePath(path);
+    this.existenceCache.delete(normalized);
+    // Also invalidate parent
+    this.existenceCache.delete(ensureDirectoryPath(getParentPath(normalized)));
+  }
+
+  /**
+   * Clear the entire existence cache.
+   */
+  clearExistenceCache(): void {
+    this.existenceCache.clear();
   }
 }

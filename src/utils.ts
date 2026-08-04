@@ -166,3 +166,31 @@ export function joinPath(...segments: string[]): string {
   
   return joined || '';
 }
+
+// ---------------------------------------------------------------------------
+// mtime Sidecar Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute the .mtime sidecar path for a given file path.
+ *
+ * /documents/note.json → /documents/.note.json.mtime
+ * /config.json         → /.config.json.mtime
+ */
+export function mtimePathFor(filePath: string): string {
+  const lastSlash = filePath.lastIndexOf('/');
+  const dir = lastSlash >= 0 ? filePath.slice(0, lastSlash) : '';
+  const fileName = lastSlash >= 0 ? filePath.slice(lastSlash + 1) : filePath;
+  const mtimeFileName = `.${fileName}.mtime`;
+  return dir ? `${dir}/${mtimeFileName}` : mtimeFileName;
+}
+
+/**
+ * Check whether a filename is a .mtime sidecar file.
+ *
+ * .note.json.mtime → true
+ * note.json        → false
+ */
+export function isMtimeSidecar(name: string): boolean {
+  return name.startsWith('.') && name.endsWith('.mtime');
+}

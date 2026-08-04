@@ -108,7 +108,9 @@ describe('Trailing slash handling', () => {
         headers: new Map(),
       });
       await fs.writeFile('/.meta/backends.json', '{"version":1}');
-      expect(lastFetchUrl()).toBe(baseUrl + '/app_data/configs/.meta/backends.json');
+      // writeFile now also writes a .mtime sidecar; check the main file PUT URL
+      const calls = mockFetch.mock.calls.map((c: any[]) => c[0]);
+      expect(calls).toContain(baseUrl + '/app_data/configs/.meta/backends.json');
     });
   });
 
@@ -191,7 +193,10 @@ describe('Trailing slash handling', () => {
       });
 
       await fs.mkdir('/new-dir', { recursive: true } as any);
-      expect(lastFetchUrl()).toBe(baseUrl + '/app_data/configs/new-dir/.keep');
+      // mkdir calls writeFile('.keep') which also writes a .mtime sidecar;
+      // check that the .keep file PUT URL (without trailing slash) was called
+      const calls = mockFetch.mock.calls.map((c: any[]) => c[0]);
+      expect(calls).toContain(baseUrl + '/app_data/configs/new-dir/.keep');
     });
   });
 

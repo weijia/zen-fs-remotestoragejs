@@ -26,6 +26,16 @@ export interface RemoteStorageConfig {
    * Request timeout in milliseconds
    */
   timeout?: number;
+
+  /**
+   * Enable precise mtime via .mtime sidecar files. Default: true
+   *
+   * When enabled, writeFile() creates a .mtime sidecar file on RemoteStorage,
+   * stat() reads it to return millisecond-precision mtime, and touch() works.
+   * Sidecar files are filtered from readdir() results — they are invisible
+   * to upper layers.
+   */
+  preciseMtime?: boolean;
 }
 
 /**

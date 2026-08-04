@@ -23,6 +23,8 @@ import {
   getCurrentTimestamp,
   isValidPath,
   joinPath,
+  mtimePathFor,
+  isMtimeSidecar,
 } from './utils.js';
 import { rsLog, rsLogResult } from './debug.js';
 
@@ -65,6 +67,18 @@ export class RemoteStorageFileSystem extends FileSystem {
   private existenceCache = new Map<string, { exists: boolean; ts: number }>();
   private static readonly NEGATIVE_CACHE_TTL = 15_000; // 15s for negative results
 
+  // --- Precise mtime ---
+  /** Whether to use .mtime sidecar files for precise mtime. Default: true */
+  private readonly usePreciseMtime: boolean;
+  /** In-memory cache of sidecar mtime values to avoid repeated GETs */
+  private mtimeCache = new Map<string, number>();
+
+  // --- Snapshot (ETag baseline for shouldSync) ---
+  /** In-memory map of path → ETag, used by shouldSync() to detect remote changes */
+  private snapshot: Map<string, string> | null = null;
+  /** Root folder's ETag, used as a quick "anything changed?" check */
+  private rootEtag: string | null = null;
+
   constructor(private config: RemoteStorageConfig) {
     super(0 as any, 0 as any); // FileSystem constructor - using type assertion for now
     
@@ -89,6 +103,9 @@ export class RemoteStorageFileSystem extends FileSystem {
     });
     
     this.timeout = config.timeout || 30000;
+
+    // Precise mtime is enabled by default
+    this.usePreciseMtime = config.preciseMtime !== false;
   }
 
   /**
@@ -259,7 +276,7 @@ export class RemoteStorageFileSystem extends FileSystem {
   /**
    * Write file contents
    */
-  async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, options?: { flag?: string }): Promise<void> {
+  async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, options?: { flag?: string; mtime?: number }): Promise<void> {
     const size = typeof data === 'string' ? data.length : (data as Uint8Array).byteLength;
     rsLog('writeFile', path, { flag: options?.flag, size });
     path = this.validateAndNormalizePath(path);
@@ -301,6 +318,16 @@ export class RemoteStorageFileSystem extends FileSystem {
       }
       rsLogResult('writeFile', path, `status=${response.status}`);
       this.invalidateExistenceCache(path);
+
+      // Write .mtime sidecar if precise mtime is enabled
+      if (this.usePreciseMtime) {
+        const mtime = options?.mtime ?? Date.now();
+        await this.writeMtimeSidecar(path, mtime);
+      }
+
+      // Update snapshot with new ETag from PUT response
+      const newEtag = response.headers.get('ETag') ?? undefined;
+      this.updateSnapshotForPath(path, newEtag ?? null);
     } catch (error) {
       rsLogResult('writeFile', path, error, false);
       if (error instanceof FileExistsError || error instanceof RemoteStorageError) {
@@ -310,6 +337,17 @@ export class RemoteStorageFileSystem extends FileSystem {
         `Failed to write file ${path}: ${error instanceof Error ? error.message : String(error)}`
       );
     }
+  }
+
+  /**
+   * Write file with precise mtime — implements SyncableFS.writeFileWithMtime.
+   *
+   * Delegates to writeFile() with { mtime } option. When preciseMtime is
+   * enabled, a .mtime sidecar is written preserving the exact mtime.
+   */
+  async writeFileWithMtime(path: string, data: string | Uint8Array | ArrayBuffer, mtime: number): Promise<void> {
+    rsLog('writeFileWithMtime', path, { mtime });
+    await this.writeFile(path, data, { mtime });
   }
 
   /**
@@ -326,6 +364,14 @@ export class RemoteStorageFileSystem extends FileSystem {
       }
       rsLogResult('unlink', path, `status=${response.status}`);
       this.removeFromExistenceCache(path);
+
+      // Delete .mtime sidecar if precise mtime is enabled
+      if (this.usePreciseMtime) {
+        await this.deleteMtimeSidecar(path);
+      }
+
+      // Update snapshot — remove the deleted path
+      this.updateSnapshotForPath(path, null);
     } catch (error) {
       rsLogResult('unlink', path, error, false);
       if (error instanceof FileNotFoundError || error instanceof RemoteStorageError) {
@@ -381,9 +427,11 @@ export class RemoteStorageFileSystem extends FileSystem {
         const html = await response.text();
         items = this.parseHtmlDirectoryListing(html);
       }
-      rsLogResult('readdir', path, `count=${items.length} [${items.join(', ')}]`);
+      // Filter out .mtime sidecar files — they are internal to RemoteStorageFileSystem
+      const filtered = items.filter(name => !isMtimeSidecar(name));
+      rsLogResult('readdir', path, `count=${filtered.length} [${filtered.join(', ')}]`);
       this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
-      return items;
+      return filtered;
     } catch (error) {
       rsLogResult('readdir', path, error, false);
       if (error instanceof DirectoryNotFoundError || error instanceof RemoteStorageError) {
@@ -695,11 +743,24 @@ export class RemoteStorageFileSystem extends FileSystem {
   }
 
   /**
-   * Modify metadata (touch)
+   * Modify metadata (touch).
+   *
+   * With precise mtime enabled, writing `mtimeMs` via the `.mtime` sidecar
+   * is supported. Other metadata fields are ignored (RemoteStorage protocol
+   * does not support them). If precise mtime is disabled, this is a no-op.
    */
   async touch(path: string, metadata: Partial<InodeLike>): Promise<void> {
     rsLog('touch', path, metadata);
-    throw new Error('Touch operation not supported by RemoteStorage');
+
+    if (this.usePreciseMtime && metadata.mtimeMs !== undefined) {
+      path = this.validateAndNormalizePath(path);
+      await this.writeMtimeSidecar(path, metadata.mtimeMs);
+      rsLogResult('touch', path, `mtimeMs=${metadata.mtimeMs}`);
+      return;
+    }
+
+    // Without precise mtime, touch is a no-op (RS doesn't support it)
+    rsLogResult('touch', path, 'no-op (preciseMtime disabled or no mtimeMs)');
   }
 
   /**
@@ -751,7 +812,17 @@ export class RemoteStorageFileSystem extends FileSystem {
             const contentLength = response.headers.get('content-length');
             const lastModified = response.headers.get('last-modified');
             const size = contentLength ? parseInt(contentLength, 10) : 0;
-            const mtime = lastModified ? new Date(lastModified).getTime() : Date.now();
+            let mtime = lastModified ? new Date(lastModified).getTime() : Date.now();
+
+            // If precise mtime is enabled, try to read the .mtime sidecar
+            // for millisecond-precision mtime
+            if (this.usePreciseMtime) {
+              const preciseMtime = await this.readMtimeSidecar(path);
+              if (preciseMtime !== undefined) {
+                mtime = preciseMtime;
+              }
+            }
+
             const result = {
               ino: 0,
               mode: 0o100644,
@@ -839,7 +910,7 @@ export class RemoteStorageFileSystem extends FileSystem {
   async readFileMeta(
     path: string,
     opts?: { ifNoneMatch?: string; ifModifiedSince?: string },
-  ): Promise<{ status: number; data?: Uint8Array; etag?: string; lastModified?: string; contentType?: string }> {
+  ): Promise<{ status: number; data?: Uint8Array; etag?: string; lastModified?: string; preciseMtime?: number; contentType?: string }> {
     rsLog('readFileMeta', path, opts);
     path = this.validateAndNormalizePath(path);
     const url = this.buildUrl(path);
@@ -862,11 +933,19 @@ export class RemoteStorageFileSystem extends FileSystem {
       }
       const data = new Uint8Array(await response.arrayBuffer());
       rsLogResult('readFileMeta', path, `200 size=${data.byteLength}`);
+
+      // Read precise mtime from sidecar if enabled
+      let preciseMtime: number | undefined;
+      if (this.usePreciseMtime) {
+        preciseMtime = await this.readMtimeSidecar(path);
+      }
+
       return {
         status: 200,
         data,
         etag: response.headers.get('ETag') ?? undefined,
         lastModified: response.headers.get('Last-Modified') ?? undefined,
+        preciseMtime,
         contentType: response.headers.get('Content-Type') ?? undefined,
       };
     } catch (error) {
@@ -1015,5 +1094,281 @@ export class RemoteStorageFileSystem extends FileSystem {
    */
   clearExistenceCache(): void {
     this.existenceCache.clear();
+  }
+
+  // ===========================================================================
+  // Precise mtime — .mtime sidecar file management
+  // ===========================================================================
+
+  /**
+   * Write (or overwrite) the `.mtime` sidecar file for `filePath`.
+   *
+   * The sidecar stores `{ "mtime": <ms> }` and is invisible to upper layers
+   * (filtered from readdir, excluded from sync).
+   */
+  private async writeMtimeSidecar(filePath: string, mtime: number): Promise<void> {
+    const sidecarPath = mtimePathFor(filePath);
+    const sidecarUrl = this.buildUrl(sidecarPath);
+    const body = JSON.stringify({ mtime });
+    try {
+      const headers = new Headers(this.headers);
+      headers.set('Content-Type', 'application/json');
+      const response = await this.makeRequest(sidecarUrl, {
+        method: 'PUT',
+        body,
+        headers,
+      });
+      if (!response.ok) {
+        rsLogResult('writeMtimeSidecar', filePath, `status=${response.status}`, false);
+      } else {
+        // Update in-memory cache
+        this.mtimeCache.set(normalizePath(filePath), mtime);
+        rsLogResult('writeMtimeSidecar', filePath, `mtime=${mtime}`);
+      }
+    } catch (error) {
+      // Sidecar write failure is non-fatal — log and continue
+      rsLogResult('writeMtimeSidecar', filePath, error, false);
+    }
+  }
+
+  /**
+   * Read the `.mtime` sidecar for `filePath` and return the precise mtime
+   * in milliseconds, or `undefined` if the sidecar does not exist / cannot
+   * be parsed.
+   */
+  private async readMtimeSidecar(filePath: string): Promise<number | undefined> {
+    const normalized = normalizePath(filePath);
+
+    // Check in-memory cache first
+    const cached = this.mtimeCache.get(normalized);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const sidecarPath = mtimePathFor(filePath);
+    const sidecarUrl = this.buildUrl(sidecarPath);
+    try {
+      const response = await this.makeRequest(sidecarUrl, { method: 'GET' });
+      if (!response.ok) {
+        return undefined;
+      }
+      const text = await response.text();
+      const parsed = JSON.parse(text);
+      if (typeof parsed.mtime === 'number') {
+        this.mtimeCache.set(normalized, parsed.mtime);
+        return parsed.mtime;
+      }
+      return undefined;
+    } catch {
+      // Sidecar missing or unreadable — fall back to server Last-Modified
+      return undefined;
+    }
+  }
+
+  /**
+   * Delete the `.mtime` sidecar for `filePath`. Called from `unlink()`.
+   * Failure is non-fatal — a stale sidecar just means stat() will return
+   * the server's Last-Modified instead.
+   */
+  private async deleteMtimeSidecar(filePath: string): Promise<void> {
+    const sidecarPath = mtimePathFor(filePath);
+    const sidecarUrl = this.buildUrl(sidecarPath);
+    try {
+      const response = await this.makeRequest(sidecarUrl, { method: 'DELETE' });
+      if (response.ok || response.status === 404) {
+        this.mtimeCache.delete(normalizePath(filePath));
+        rsLogResult('deleteMtimeSidecar', filePath, 'OK');
+      }
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  // ===========================================================================
+  // Snapshot — ETag baseline for shouldSync()
+  // ===========================================================================
+
+  /**
+   * Implement `zen-fs-sync`'s `SyncableFS.shouldSync()` interface.
+   *
+   * Compares the in-memory ETag baseline (snapshot) with the actual remote
+   * state. Returns `true` when remote changes are detected (or on first call
+   * when no baseline exists). The snapshot is rebuilt as a side effect.
+   */
+  async shouldSync(): Promise<boolean> {
+    rsLog('shouldSync', '(snapshot check)');
+
+    // First call — no baseline exists, build one and signal full sync
+    if (this.snapshot === null) {
+      await this.buildSnapshot();
+      rsLogResult('shouldSync', '', 'true (first call, baseline built)');
+      return true;
+    }
+
+    // Quick check: HEAD root folder and compare ETag
+    const currentRootEtag = await this.fetchRootEtag();
+    if (currentRootEtag === null) {
+      // Couldn't fetch root ETag — err on the side of syncing
+      rsLogResult('shouldSync', '', 'true (root ETag unavailable)');
+      return true;
+    }
+
+    if (currentRootEtag === this.rootEtag) {
+      rsLogResult('shouldSync', '', 'false (root ETag unchanged)');
+      return false;
+    }
+
+    // Root ETag changed — rebuild snapshot (with subtree pruning) and sync
+    await this.buildSnapshot();
+    rsLogResult('shouldSync', '', 'true (root ETag changed)');
+    return true;
+  }
+
+  /**
+   * Fetch only the root folder's ETag via a HEAD request.
+   * Returns `null` if the request fails or no ETag is present.
+   */
+  private async fetchRootEtag(): Promise<string | null> {
+    const rootUrl = this.buildUrl('/');
+    try {
+      const response = await this.makeRequest(rootUrl, { method: 'HEAD' });
+      if (!response.ok) {
+        return null;
+      }
+      return response.headers.get('ETag');
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Build (or rebuild) the in-memory snapshot by walking the remote folder
+   * tree and recording ETags for every document and folder.
+   *
+   * Uses subtree pruning: if a subfolder's ETag hasn't changed since the
+   * previous snapshot, its subtree is skipped entirely.
+   */
+  private async buildSnapshot(): Promise<void> {
+    rsLog('buildSnapshot', '(building ETag baseline)');
+
+    const previousSnapshot = this.snapshot;
+    const previousRootEtag = this.rootEtag;
+
+    this.snapshot = new Map<string, string>();
+
+    // Fetch root folder listing
+    const rootEtag = await this.fetchRootEtag();
+    this.rootEtag = rootEtag;
+
+    await this.buildSnapshotRecursive('/', previousSnapshot);
+
+    rsLogResult('buildSnapshot', '', `entries=${this.snapshot.size}`);
+  }
+
+  /**
+   * Recursive helper for `buildSnapshot()`. Walks a folder, stores ETags for
+   * all items, and prunes subtrees whose ETag is unchanged from the previous
+   * snapshot.
+   */
+  private async buildSnapshotRecursive(
+    dirPath: string,
+    previousSnapshot: Map<string, string> | null,
+  ): Promise<void> {
+    const dirUrl = this.buildUrl(ensureDirectoryPath(dirPath));
+    try {
+      const response = await this.makeRequest(dirUrl, {
+        method: 'GET',
+        headers: { Accept: 'application/ld+json' },
+      });
+      if (!response.ok) {
+        return;
+      }
+
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.includes('application/ld+json')) {
+        return;
+      }
+
+      const listing = await response.json();
+      const items: { name: string; etag?: string; isDir: boolean }[] = [];
+
+      if (listing['@graph']) {
+        for (const item of listing['@graph']) {
+          if (item['@id'] && item['@id'] !== './') {
+            const rawName = item['@id'];
+            const isDir = rawName.endsWith('/');
+            const name = isDir ? rawName.slice(0, -1) : rawName;
+            if (name) {
+              items.push({ name, etag: item['ETag'] ?? item['etag'], isDir });
+            }
+          }
+        }
+      } else if (listing['items'] && typeof listing['items'] === 'object') {
+        for (const entryKey of Object.keys(listing['items'])) {
+          if (entryKey && entryKey !== './') {
+            const isDir = entryKey.endsWith('/');
+            const name = isDir ? entryKey.slice(0, -1) : entryKey;
+            const item = listing['items'][entryKey];
+            if (name) {
+              items.push({ name, etag: item?.ETag ?? item?.etag, isDir });
+            }
+          }
+        }
+      }
+
+      for (const item of items) {
+        const itemPath = dirPath === '/' ? item.name : `${dirPath}/${item.name}`;
+
+        // Skip .mtime sidecar files — they are internal
+        if (isMtimeSidecar(item.name)) {
+          continue;
+        }
+
+        // Store ETag in snapshot
+        if (item.etag) {
+          this.snapshot!.set(itemPath, item.etag);
+        }
+
+        if (item.isDir) {
+          // Subtree pruning: if this folder's ETag is unchanged from the
+          // previous snapshot, skip recursing into it
+          const prevEtag = previousSnapshot?.get(itemPath);
+          if (prevEtag && item.etag && prevEtag === item.etag) {
+            // Copy all previous entries under this subtree
+            const prefix = itemPath + '/';
+            for (const [prevPath, prevVal] of previousSnapshot!) {
+              if (prevPath.startsWith(prefix) || prevPath === itemPath) {
+                this.snapshot!.set(prevPath, prevVal);
+              }
+            }
+            continue;
+          }
+          // ETag changed (or no previous data) — recurse
+          await this.buildSnapshotRecursive(itemPath, previousSnapshot);
+        }
+      }
+    } catch {
+      // Network errors on a subfolder are non-fatal for snapshot building
+    }
+  }
+
+  /**
+   * Update the in-memory snapshot after a local write or delete.
+   * Called internally by `writeFile()` and `unlink()`.
+   */
+  private updateSnapshotForPath(path: string, etag: string | null): void {
+    if (this.snapshot === null) {
+      // Snapshot not yet built — nothing to update
+      return;
+    }
+
+    const normalized = normalizePath(path);
+    if (etag === null) {
+      this.snapshot.delete(normalized);
+    } else {
+      this.snapshot.set(normalized, etag);
+    }
+    // Mark rootEtag as stale — we just modified a file on the remote
+    this.rootEtag = null;
   }
 }

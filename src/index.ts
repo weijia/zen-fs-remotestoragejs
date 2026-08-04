@@ -33,6 +33,8 @@ export {
   getCurrentTimestamp,
   isValidPath,
   joinPath,
+  mtimePathFor,
+  isMtimeSidecar,
 } from './utils.js';
 export {
   createUniversalSyncFileSystem,

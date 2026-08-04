@@ -62,3 +62,6 @@ playwright-report/
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# Local package tarballs
+*.tgz

@@ -181,7 +181,8 @@ export function mtimePathFor(filePath: string): string {
   const lastSlash = filePath.lastIndexOf('/');
   const dir = lastSlash >= 0 ? filePath.slice(0, lastSlash) : '';
   const fileName = lastSlash >= 0 ? filePath.slice(lastSlash + 1) : filePath;
-  const mtimeFileName = `.${fileName}.mtime`;
+  // Avoid double dot: if fileName already starts with '.', don't add another
+  const mtimeFileName = fileName.startsWith('.') ? `${fileName}.mtime` : `.${fileName}.mtime`;
   return dir ? `${dir}/${mtimeFileName}` : mtimeFileName;
 }
 

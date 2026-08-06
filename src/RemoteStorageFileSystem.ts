@@ -67,6 +67,16 @@ export class RemoteStorageFileSystem extends FileSystem {
   private existenceCache = new Map<string, { exists: boolean; ts: number }>();
   private static readonly NEGATIVE_CACHE_TTL = 15_000; // 15s for negative results
 
+  /**
+   * Whether HEAD is supported by this server.
+   * - `null`  = unknown, will probe on first stat()
+   * - `false` = server returned 405 or similar, skip HEAD in future calls
+   * - `true`  = HEAD works, use it as the fast path
+   *
+   * This avoids wasting a request on servers that don't support HEAD.
+   */
+  private headSupported: boolean | null = null;
+
   // --- Precise mtime ---
   /** Whether to use .mtime sidecar files for precise mtime. Default: true */
   private readonly usePreciseMtime: boolean;
@@ -802,14 +812,15 @@ export class RemoteStorageFileSystem extends FileSystem {
     const callerSaysDir = path.endsWith('/');
 
     // ---- Stage 1: HEAD probe (fast path) ----
-    // Many RemoteStorage servers support HEAD and return useful headers.
-    // But some return 405 (Method Not Allowed) or other errors — those
-    // must NOT abort stat(); we simply fall through to stage 2/3.
-    if (!callerSaysDir) {
+    // HEAD gives us size + mtime for free, which readdir cannot.
+    // But some servers return 405 (Method Not Allowed). Once we detect that,
+    // we cache it and skip HEAD entirely for future calls.
+    if (!callerSaysDir && this.headSupported !== false) {
       const fileUrl = this.buildUrl(path);
       try {
         const response = await this.makeRequest(fileUrl, { method: 'HEAD' });
         if (response.ok) {
+          this.headSupported = true; // HEAD works on this server
           const contentType = response.headers.get('content-type') || '';
           // If HEAD returns a directory content-type, don't treat it as a file
           if (!contentType.includes('application/ld+json') && !contentType.includes('text/html')) {
@@ -844,11 +855,14 @@ export class RemoteStorageFileSystem extends FileSystem {
             return result;
           }
         }
-        // Non-OK responses (404, 405, 500, etc.) — fall through to stage 2.
-        // Only re-throw auth errors; everything else is recoverable.
-        if (response.status === 401 || response.status === 403) {
+        // 405 = HEAD not supported — cache this and skip HEAD in future
+        if (response.status === 405) {
+          this.headSupported = false;
+          rsLog('stat', path, { headStatus: 405, cachedAsUnsupported: true });
+        } else if (response.status === 401 || response.status === 403) {
           this.handleHttpError(response, path, 'stat');
         }
+        // Other non-OK (404, 500, etc.) — fall through, don't cache
         rsLog('stat', path, { headStatus: response.status, fallingThrough: 'directory probe' });
       } catch (error) {
         // Only re-throw auth errors; network errors and 405/500 fall through.

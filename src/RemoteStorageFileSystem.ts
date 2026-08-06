@@ -68,6 +68,14 @@ export class RemoteStorageFileSystem extends FileSystem {
   private static readonly NEGATIVE_CACHE_TTL = 15_000; // 15s for negative results
 
   /**
+   * Directory listing cache — caches readdir() results so that multiple
+   * stat() calls on files in the same directory share one network request.
+   * Invalidated on any write/delete within the directory.
+   */
+  private dirListingCache = new Map<string, { entries: Set<string>; ts: number }>();
+  private static readonly DIR_LISTING_TTL = 30_000; // 30s
+
+  /**
    * Whether HEAD is supported by this server.
    * - `null`  = unknown, will probe on first stat()
    * - `false` = server returned 405 or similar, skip HEAD in future calls
@@ -442,6 +450,8 @@ export class RemoteStorageFileSystem extends FileSystem {
       const filtered = items.filter(name => !isMtimeSidecar(name));
       rsLogResult('readdir', path, `count=${filtered.length} [${filtered.join(', ')}]`);
       this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
+      // Cache the directory listing for stat() existence checks
+      this.cacheDirListing(path, filtered);
       return filtered;
     } catch (error) {
       rsLogResult('readdir', path, error, false);
@@ -807,30 +817,73 @@ export class RemoteStorageFileSystem extends FileSystem {
       throw new RemoteStorageError('Invalid path format');
     }
 
+    const callerSaysDir = path.endsWith('/');
+    const baseName = getBasename(path);
+
+    // ---- Stage 0: Existence check via directory listing ----
+    // Before any HEAD/GET, check the cached (or freshly fetched) parent
+    // directory listing. If the file isn't there, it doesn't exist —
+    // no need to waste a HEAD request.
+    let existsViaDir = false;
+    let isDirViaDir = false;
+    let dirListingAvailable = false;
+    if (baseName) {
+      const parentPath = getParentPath(path);
+      const parentDir = parentPath ? `/${parentPath}/` : '/';
+      let entries = this.getCachedDirListing(parentDir);
+      if (entries === null) {
+        // Cache miss — fetch directory listing once, cache it for siblings
+        try {
+          const list = await this.readdir(parentDir);
+          entries = this.getCachedDirListing(parentDir);
+          if (entries === null) {
+            this.cacheDirListing(parentDir, list);
+            entries = this.getCachedDirListing(parentDir);
+          }
+        } catch {
+          entries = null; // parent dir doesn't exist or can't be read
+        }
+      }
+      if (entries) {
+        dirListingAvailable = true;
+        if (entries.has(baseName)) {
+          existsViaDir = true;
+          isDirViaDir = false;
+        } else if (entries.has(baseName + '/')) {
+          existsViaDir = true;
+          isDirViaDir = true;
+        }
+      }
+    }
+
+    // If parent directory was successfully listed but file is NOT in it,
+    // the file definitely doesn't exist — short-circuit.
+    if (dirListingAvailable && !existsViaDir && !callerSaysDir) {
+      rsLogResult('stat', path, 'FileNotFoundError (not in dir listing)', false);
+      throw new FileNotFoundError(path);
+    }
+
     // If the caller explicitly passes a trailing slash, they already know
     // it's a directory — skip the file probe entirely.
-    const callerSaysDir = path.endsWith('/');
-
-    // ---- Stage 1: HEAD probe (fast path) ----
-    // HEAD gives us size + mtime for free, which readdir cannot.
-    // But some servers return 405 (Method Not Allowed). Once we detect that,
-    // we cache it and skip HEAD entirely for future calls.
-    if (!callerSaysDir && this.headSupported !== false) {
+    // Try HEAD when: (a) dir listing confirmed file exists, or (b) dir
+    // listing wasn't available (parent unreadable) — HEAD as fallback.
+    const shouldTryHead = !callerSaysDir && this.headSupported !== false
+      && (existsViaDir || !dirListingAvailable) && !isDirViaDir;
+    if (shouldTryHead) {
+      // ---- Stage 1: HEAD probe (metadata) ----
+      // File confirmed to exist via directory listing. Now fetch metadata.
       const fileUrl = this.buildUrl(path);
       try {
         const response = await this.makeRequest(fileUrl, { method: 'HEAD' });
         if (response.ok) {
-          this.headSupported = true; // HEAD works on this server
+          this.headSupported = true;
           const contentType = response.headers.get('content-type') || '';
-          // If HEAD returns a directory content-type, don't treat it as a file
           if (!contentType.includes('application/ld+json') && !contentType.includes('text/html')) {
             const contentLength = response.headers.get('content-length');
             const lastModified = response.headers.get('last-modified');
             const size = contentLength ? parseInt(contentLength, 10) : 0;
             let mtime = lastModified ? new Date(lastModified).getTime() : Date.now();
 
-            // If precise mtime is enabled, try to read the .mtime sidecar
-            // for millisecond-precision mtime
             if (this.usePreciseMtime) {
               const preciseMtime = await this.readMtimeSidecar(path);
               if (preciseMtime !== undefined) {
@@ -839,41 +892,50 @@ export class RemoteStorageFileSystem extends FileSystem {
             }
 
             const result = {
-              ino: 0,
-              mode: 0o100644,
-              uid: 0,
-              gid: 0,
-              size,
-              mtimeMs: mtime,
-              ctimeMs: mtime,
-              atimeMs: mtime,
-              birthtimeMs: mtime,
-              nlink: 1,
+              ino: 0, mode: 0o100644, uid: 0, gid: 0,
+              size, mtimeMs: mtime, ctimeMs: mtime, atimeMs: mtime, birthtimeMs: mtime, nlink: 1,
             };
             rsLogResult('stat', path, `FILE mode=${result.mode.toString(8)} size=${size}`);
             this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
             return result;
           }
         }
-        // 405 = HEAD not supported — cache this and skip HEAD in future
         if (response.status === 405) {
           this.headSupported = false;
           rsLog('stat', path, { headStatus: 405, cachedAsUnsupported: true });
         } else if (response.status === 401 || response.status === 403) {
           this.handleHttpError(response, path, 'stat');
         }
-        // Other non-OK (404, 500, etc.) — fall through, don't cache
-        rsLog('stat', path, { headStatus: response.status, fallingThrough: 'directory probe' });
+        rsLog('stat', path, { headStatus: response.status, fallingThrough: 'readdir stat' });
       } catch (error) {
-        // Only re-throw auth errors; network errors and 405/500 fall through.
         if (error instanceof AuthenticationError || error instanceof PermissionDeniedError) {
           throw error;
         }
-        rsLog('stat', path, { headError: error instanceof Error ? error.message : String(error), fallingThrough: 'directory probe' });
+        rsLog('stat', path, { headError: error instanceof Error ? error.message : String(error), fallingThrough: 'readdir stat' });
       }
     }
 
-    // ---- Stage 2: directory GET (with trailing slash) ----
+    // ---- Stage 2: Return stat from directory listing or directory probe ----
+
+    // File confirmed as directory via listing
+    if (existsViaDir && isDirViaDir) {
+      rsLogResult('stat', path, `DIR mode=40755 (via dir listing)`);
+      this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
+      return { ino: 0, mode: 0o040755, uid: 0, gid: 0, size: 0,
+        mtimeMs: Date.now(), ctimeMs: Date.now(), atimeMs: Date.now(), birthtimeMs: Date.now(), nlink: 1 };
+    }
+
+    // File confirmed as regular file via listing, but HEAD unavailable
+    // (either not supported or returned error). Return what we know.
+    if (existsViaDir && !isDirViaDir) {
+      rsLogResult('stat', path, `FILE mode=100644 (via dir listing, no metadata)`);
+      this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
+      return { ino: 0, mode: 0o100644, uid: 0, gid: 0, size: 0,
+        mtimeMs: Date.now(), ctimeMs: Date.now(), atimeMs: Date.now(), birthtimeMs: Date.now(), nlink: 1 };
+    }
+
+    // File not found in directory listing — but if parent dir wasn't readable,
+    // fall back to directory probe (trailing slash GET) as last resort.
     const dirPath = path.endsWith('/') ? path : path + '/';
     const dirUrl = this.buildUrl(dirPath);
     try {
@@ -884,63 +946,18 @@ export class RemoteStorageFileSystem extends FileSystem {
       if (response.ok) {
         const contentType = response.headers.get('content-type') || '';
         if (contentType.includes('application/ld+json') || contentType.includes('text/html')) {
-          rsLogResult('stat', path, `DIR mode=40755`);
+          rsLogResult('stat', path, `DIR mode=40755 (via dir probe)`);
           this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
-          return {
-            ino: 0,
-            mode: 0o040755,
-            uid: 0,
-            gid: 0,
-            size: 0,
-            mtimeMs: Date.now(),
-            ctimeMs: Date.now(),
-            atimeMs: Date.now(),
-            birthtimeMs: Date.now(),
-            nlink: 1,
-          };
+          return { ino: 0, mode: 0o040755, uid: 0, gid: 0, size: 0,
+            mtimeMs: Date.now(), ctimeMs: Date.now(), atimeMs: Date.now(), birthtimeMs: Date.now(), nlink: 1 };
         }
       }
-      // Non-OK, non-auth errors fall through to readdir fallback.
       if (response.status === 401 || response.status === 403) {
         this.handleHttpError(response, path, 'stat');
       }
-      rsLog('stat', path, { dirGetStatus: response.status, fallingThrough: 'readdir' });
     } catch (error) {
       if (error instanceof AuthenticationError || error instanceof PermissionDeniedError) {
         throw error;
-      }
-      rsLog('stat', path, { dirGetError: error instanceof Error ? error.message : String(error), fallingThrough: 'readdir' });
-    }
-
-    // ---- Stage 3: readdir fallback (most reliable) ----
-    // RemoteStorage servers always support GET on a directory to list its
-    // contents. If the file appears in the parent directory listing, it
-    // exists — regardless of what HEAD or the directory probe returned.
-    const parentPath = getParentPath(path);
-    const baseName = getBasename(path);
-    if (baseName) {
-      try {
-        const parentDir = parentPath ? `/${parentPath}/` : '/';
-        const entries = await this.readdir(parentDir);
-        if (entries.includes(baseName) || entries.includes(baseName + '/')) {
-          const isEntryDir = entries.includes(baseName + '/');
-          rsLogResult('stat', path, `${isEntryDir ? 'DIR' : 'FILE'} (via readdir fallback) mode=${isEntryDir ? '040755' : '100644'}`);
-          this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
-          return {
-            ino: 0,
-            mode: isEntryDir ? 0o040755 : 0o100644,
-            uid: 0,
-            gid: 0,
-            size: 0,
-            mtimeMs: Date.now(),
-            ctimeMs: Date.now(),
-            atimeMs: Date.now(),
-            birthtimeMs: Date.now(),
-            nlink: 1,
-          };
-        }
-      } catch {
-        // Parent directory doesn't exist or can't be read
       }
     }
 
@@ -1124,6 +1141,8 @@ export class RemoteStorageFileSystem extends FileSystem {
     this.existenceCache.delete(normalized);
     // Also invalidate the parent directory (readdir results may change)
     this.existenceCache.delete(ensureDirectoryPath(getParentPath(normalized)));
+    // Invalidate directory listing cache for the parent
+    this.invalidateDirListingCache(normalized);
     // Mark the path itself as existing (it was just written/created)
     this.existenceCache.set(normalized, { exists: true, ts: Date.now() });
   }
@@ -1136,6 +1155,56 @@ export class RemoteStorageFileSystem extends FileSystem {
     this.existenceCache.delete(normalized);
     // Also invalidate parent
     this.existenceCache.delete(ensureDirectoryPath(getParentPath(normalized)));
+    // Invalidate directory listing cache for the parent
+    this.invalidateDirListingCache(normalized);
+  }
+
+  // -------------------------------------------------------------------------
+  // Directory listing cache management
+  // -------------------------------------------------------------------------
+
+  /**
+   * Get the cached directory listing for a directory path, or null if
+   * not cached / expired. Does NOT make any network requests.
+   */
+  private getCachedDirListing(dirPath: string): Set<string> | null {
+    const key = normalizePath(dirPath);
+    const cached = this.dirListingCache.get(key);
+    if (cached && Date.now() - cached.ts < RemoteStorageFileSystem.DIR_LISTING_TTL) {
+      return cached.entries;
+    }
+    if (cached) {
+      this.dirListingCache.delete(key); // expired
+    }
+    return null;
+  }
+
+  /**
+   * Cache a directory listing result.
+   */
+  private cacheDirListing(dirPath: string, entries: string[]): void {
+    const key = normalizePath(dirPath);
+    // Store names both with and without trailing slash for dirs
+    const set = new Set<string>();
+    for (const e of entries) {
+      set.add(e);
+      if (e.endsWith('/')) set.add(e);
+      else set.add(e + '/'); // also store with trailing slash for dir detection
+    }
+    this.dirListingCache.set(key, { entries: set, ts: Date.now() });
+  }
+
+  /**
+   * Invalidate the directory listing cache for the parent of `path`.
+   * Called after writes/deletes because the parent directory's contents changed.
+   */
+  private invalidateDirListingCache(path: string): void {
+    const parent = getParentPath(path);
+    if (parent) {
+      this.dirListingCache.delete(parent);
+    } else {
+      this.dirListingCache.delete(''); // root
+    }
   }
 
   /**
@@ -1143,6 +1212,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    */
   clearExistenceCache(): void {
     this.existenceCache.clear();
+    this.dirListingCache.clear();
   }
 
   // ===========================================================================

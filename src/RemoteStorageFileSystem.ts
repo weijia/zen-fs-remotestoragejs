@@ -140,6 +140,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       try {
         const response = await fetch(url, {
           ...options,
+          credentials: 'omit',
           headers: {
             'Authorization': `Bearer ${this.config.token}`,
             'Content-Type': 'application/json',

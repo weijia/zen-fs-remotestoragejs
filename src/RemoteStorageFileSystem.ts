@@ -881,6 +881,36 @@ export class RemoteStorageFileSystem extends FileSystem {
         }
       }
       if (response.status === 404) {
+        // Last resort: check parent directory listing.
+        // Some RemoteStorage servers don't support HEAD properly, so a file
+        // that exists may not be found via HEAD. readdir() uses GET and
+        // works reliably — use it to confirm file existence.
+        const parentPath = getParentPath(path);
+        const baseName = getBasename(path);
+        if (baseName) {
+          try {
+            const parentDir = parentPath ? `/${parentPath}/` : '/';
+            const entries = await this.readdir(parentDir);
+            if (entries.includes(baseName) || entries.includes(baseName + '/')) {
+              const isEntryDir = entries.includes(baseName + '/');
+              rsLogResult('stat', path, `FILE (via readdir fallback) mode=${isEntryDir ? '040755' : '100644'}`);
+              return {
+                ino: 0,
+                mode: isEntryDir ? 0o040755 : 0o100644,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                mtimeMs: Date.now(),
+                ctimeMs: Date.now(),
+                atimeMs: Date.now(),
+                birthtimeMs: Date.now(),
+                nlink: 1,
+              };
+            }
+          } catch {
+            // Parent directory doesn't exist or can't be read
+          }
+        }
         rsLogResult('stat', path, 'FileNotFoundError', false);
         throw new FileNotFoundError(path);
       }

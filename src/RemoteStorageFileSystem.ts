@@ -35,7 +35,7 @@ import { createCacheStorage, CacheStorage } from './persistence.js';
 interface DirEntry {
   name: string;
   isDir: boolean;
-  etag?: string;
+  etag?: string | null;
   size?: number;
   lastModified?: string;
 }

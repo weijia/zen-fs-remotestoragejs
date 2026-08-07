@@ -559,13 +559,17 @@ export class RemoteStorageFileSystem extends FileSystem {
         const names = this.parseHtmlDirectoryListing(html);
         entries = names.map(name => ({ name, isDir: name.endsWith('/'), etag: undefined }));
       }
-      // Filter out .mtime sidecar files — they are internal to RemoteStorageFileSystem
+      // Cache the FULL directory listing (including sidecar files) so that
+      // readMtimeSidecar() can check existence without a 404 request.
+      // Only filter sidecars from the returned names array.
+      this.cacheDirListing(path, entries, response.headers.get('ETag'));
+
+      // Filter out .mtime sidecar files from the returned names — they are
+      // internal to RemoteStorageFileSystem and invisible to upper layers.
       const filtered = entries.filter(e => !isMtimeSidecar(e.name));
       const names = filtered.map(e => e.name);
       rsLogResult('readdir', path, `count=${names.length} [${names.join(', ')}]`);
       this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
-      // Cache the directory listing (with metadata) for stat() existence/metadata
-      this.cacheDirListing(path, filtered, response.headers.get('ETag'));
       return names;
     } catch (error) {
       rsLogResult('readdir', path, error, false);
@@ -1497,8 +1501,23 @@ export class RemoteStorageFileSystem extends FileSystem {
       return idbCached;
     }
 
-    // 3. Fetch from remote
+    // 3. Check dirListingCache — if the sidecar file is NOT in the directory
+    //    listing, we know it doesn't exist and can skip the network request.
+    //    The directory listing (cached from readdir) includes sidecar files.
     const sidecarPath = mtimePathFor(filePath);
+    const lastSlash = sidecarPath.lastIndexOf('/');
+    const sidecarDir = lastSlash >= 0 ? sidecarPath.slice(0, lastSlash) : '';
+    const sidecarName = lastSlash >= 0 ? sidecarPath.slice(lastSlash + 1) : sidecarPath;
+    if (sidecarDir) {
+      const dirEntries = this.getCachedDirListing(sidecarDir);
+      if (dirEntries !== null && !dirEntries.has(sidecarName)) {
+        // Sidecar is definitely not in the directory listing — skip the GET.
+        // Cache the negative result to avoid re-checking on future stat() calls.
+        return undefined;
+      }
+    }
+
+    // 4. Fetch from remote (sidecar may exist but wasn't in the cached listing)
     const sidecarUrl = this.buildUrl(sidecarPath);
     try {
       const response = await this.makeRequest(sidecarUrl, { method: 'GET' });

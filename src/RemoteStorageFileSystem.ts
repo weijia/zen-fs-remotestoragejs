@@ -28,6 +28,7 @@ import {
 } from './utils.js';
 import { rsLog, rsLogResult } from './debug.js';
 import { createCacheStorage, CacheStorage } from './persistence.js';
+import { IdbKVStore } from 'zen-fs-cache';
 
 /**
  * A single cached child entry within a directory listing.
@@ -125,6 +126,14 @@ export class RemoteStorageFileSystem extends FileSystem {
   private snapshot: Map<string, string> | null = null;
   /** Root folder's ETag, used as a quick "anything changed?" check */
   private rootEtag: string | null = null;
+  /** Whether we've already attempted to restore snapshot from IndexedDB */
+  private snapshotLoaded: boolean = false;
+
+  // --- IndexedDB persistence for snapshot and mtimeCache ---
+  /** Persists the ETag snapshot and rootEtag across page reloads. */
+  private readonly snapshotStore: IdbKVStore;
+  /** Persists mtimeCache (path → mtime ms) across page reloads. */
+  private readonly mtimeStore: IdbKVStore;
 
   // --- Persistent directory cache ---
   /** Whether the directory-listing cache is persisted to local storage. */
@@ -175,6 +184,11 @@ export class RemoteStorageFileSystem extends FileSystem {
         config.cacheFile,
       );
     }
+
+    // IndexedDB persistence for snapshot and mtimeCache
+    const idbDbBase = `zen-fs-remotestorage:${this.cacheNamespace}`;
+    this.snapshotStore = new IdbKVStore(`${idbDbBase}:snapshot`, 'cache');
+    this.mtimeStore = new IdbKVStore(`${idbDbBase}:mtime`, 'cache');
   }
 
   /**
@@ -1447,7 +1461,10 @@ export class RemoteStorageFileSystem extends FileSystem {
         rsLogResult('writeMtimeSidecar', filePath, `status=${response.status}`, false);
       } else {
         // Update in-memory cache
-        this.mtimeCache.set(normalizePath(filePath), mtime);
+        const normalized = normalizePath(filePath);
+        this.mtimeCache.set(normalized, mtime);
+        // Persist to IndexedDB
+        this.mtimeStore.set(normalized, mtime).catch(() => {});
         rsLogResult('writeMtimeSidecar', filePath, `mtime=${mtime}`);
       }
     } catch (error) {
@@ -1460,16 +1477,27 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Read the `.mtime` sidecar for `filePath` and return the precise mtime
    * in milliseconds, or `undefined` if the sidecar does not exist / cannot
    * be parsed.
+   *
+   * Checks in-memory cache first, then IndexedDB (for cross-session
+   * persistence), then falls back to a network GET.
    */
   private async readMtimeSidecar(filePath: string): Promise<number | undefined> {
     const normalized = normalizePath(filePath);
 
-    // Check in-memory cache first
+    // 1. Check in-memory cache first
     const cached = this.mtimeCache.get(normalized);
     if (cached !== undefined) {
       return cached;
     }
 
+    // 2. Check IndexedDB (may have been persisted in a previous session)
+    const idbCached = await this.mtimeStore.get<number>(normalized);
+    if (idbCached !== undefined) {
+      this.mtimeCache.set(normalized, idbCached);
+      return idbCached;
+    }
+
+    // 3. Fetch from remote
     const sidecarPath = mtimePathFor(filePath);
     const sidecarUrl = this.buildUrl(sidecarPath);
     try {
@@ -1481,6 +1509,8 @@ export class RemoteStorageFileSystem extends FileSystem {
       const parsed = JSON.parse(text);
       if (typeof parsed.mtime === 'number') {
         this.mtimeCache.set(normalized, parsed.mtime);
+        // Persist to IndexedDB
+        this.mtimeStore.set(normalized, parsed.mtime).catch(() => {});
         return parsed.mtime;
       }
       return undefined;
@@ -1498,10 +1528,12 @@ export class RemoteStorageFileSystem extends FileSystem {
   private async deleteMtimeSidecar(filePath: string): Promise<void> {
     const sidecarPath = mtimePathFor(filePath);
     const sidecarUrl = this.buildUrl(sidecarPath);
+    const normalized = normalizePath(filePath);
     try {
       const response = await this.makeRequest(sidecarUrl, { method: 'DELETE' });
       if (response.ok || response.status === 404) {
-        this.mtimeCache.delete(normalizePath(filePath));
+        this.mtimeCache.delete(normalized);
+        this.mtimeStore.delete(normalized).catch(() => {});
         rsLogResult('deleteMtimeSidecar', filePath, 'OK');
       }
     } catch {
@@ -1519,12 +1551,33 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Compares the in-memory ETag baseline (snapshot) with the actual remote
    * state. Returns `true` when remote changes are detected (or on first call
    * when no baseline exists). The snapshot is rebuilt as a side effect.
+   *
+   * On first call, attempts to restore the snapshot from IndexedDB. If the
+   * persisted rootEtag still matches the remote root, returns `false` —
+   * skipping the expensive full tree walk.
    */
   async shouldSync(): Promise<boolean> {
     rsLog('shouldSync', '(snapshot check)');
 
-    // First call — no baseline exists, build one and signal full sync
+    // First call — try restoring from IndexedDB before building from scratch
     if (this.snapshot === null) {
+      // Attempt to restore snapshot from IndexedDB
+      await this.loadSnapshotFromIDB();
+
+      if (this.snapshot !== null && this.rootEtag !== null) {
+        // Snapshot restored — check if root ETag is still the same
+        const currentRootEtag = await this.fetchRootEtag();
+        if (currentRootEtag !== null && currentRootEtag === this.rootEtag) {
+          rsLogResult('shouldSync', '', 'false (snapshot restored from IDB, root ETag unchanged)');
+          return false;
+        }
+        // Root ETag changed (or unavailable) — rebuild snapshot with pruning
+        await this.buildSnapshot();
+        rsLogResult('shouldSync', '', 'true (snapshot restored but root ETag changed)');
+        return true;
+      }
+
+      // No persisted snapshot — build one from scratch and signal full sync
       await this.buildSnapshot();
       rsLogResult('shouldSync', '', 'true (first call, baseline built)');
       return true;
@@ -1572,6 +1625,9 @@ export class RemoteStorageFileSystem extends FileSystem {
    *
    * Uses subtree pruning: if a subfolder's ETag hasn't changed since the
    * previous snapshot, its subtree is skipped entirely.
+   *
+   * After building, persists the snapshot and rootEtag to IndexedDB so that
+   * the next session can skip the full tree walk if the root ETag is unchanged.
    */
   private async buildSnapshot(): Promise<void> {
     rsLog('buildSnapshot', '(building ETag baseline)');
@@ -1588,6 +1644,53 @@ export class RemoteStorageFileSystem extends FileSystem {
     await this.buildSnapshotRecursive('/', previousSnapshot);
 
     rsLogResult('buildSnapshot', '', `entries=${this.snapshot.size}`);
+
+    // Persist snapshot and rootEtag to IndexedDB (fire-and-forget)
+    this.persistSnapshotToIDB();
+  }
+
+  /**
+   * Load the ETag snapshot and rootEtag from IndexedDB into memory.
+   * Called once on the first shouldSync() call to enable a warm start.
+   * Sets `snapshotLoaded` to true regardless of whether data was found.
+   */
+  private async loadSnapshotFromIDB(): Promise<void> {
+    if (this.snapshotLoaded) return;
+    this.snapshotLoaded = true;
+
+    try {
+      const [entries, rootEtag] = await Promise.all([
+        this.snapshotStore.entries<string>(),
+        this.snapshotStore.get<string>('__rootEtag__'),
+      ]);
+
+      if (entries.length > 0) {
+        this.snapshot = new Map<string, string>();
+        for (const [path, etag] of entries) {
+          if (path !== '__rootEtag__') {
+            this.snapshot.set(path, etag);
+          }
+        }
+        this.rootEtag = rootEtag ?? null;
+        rsLogResult('shouldSync', '', `restored snapshot from IDB: ${this.snapshot.size} entries, rootEtag=${this.rootEtag}`);
+      }
+    } catch {
+      // IndexedDB unavailable — fall through to building from scratch
+    }
+  }
+
+  /**
+   * Persist the current snapshot and rootEtag to IndexedDB (fire-and-forget).
+   * Called after buildSnapshot() and updateSnapshotForPath().
+   */
+  private persistSnapshotToIDB(): void {
+    if (this.snapshot === null) return;
+    // Store rootEtag under a reserved key
+    const entries: [string, string][] = [['__rootEtag__', this.rootEtag ?? '']];
+    for (const [path, etag] of this.snapshot) {
+      entries.push([path, etag]);
+    }
+    this.snapshotStore.setMany(entries).catch(() => {});
   }
 
   /**
@@ -1680,6 +1783,9 @@ export class RemoteStorageFileSystem extends FileSystem {
   /**
    * Update the in-memory snapshot after a local write or delete.
    * Called internally by `writeFile()` and `unlink()`.
+   *
+   * Persists the change to IndexedDB so the snapshot stays consistent across
+   * page reloads.
    */
   private updateSnapshotForPath(path: string, etag: string | null): void {
     if (this.snapshot === null) {
@@ -1690,10 +1796,13 @@ export class RemoteStorageFileSystem extends FileSystem {
     const normalized = normalizePath(path);
     if (etag === null) {
       this.snapshot.delete(normalized);
+      this.snapshotStore.delete(normalized).catch(() => {});
     } else {
       this.snapshot.set(normalized, etag);
+      this.snapshotStore.set(normalized, etag).catch(() => {});
     }
     // Mark rootEtag as stale — we just modified a file on the remote
     this.rootEtag = null;
+    this.snapshotStore.set('__rootEtag__', '').catch(() => {});
   }
 }

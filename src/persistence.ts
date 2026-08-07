@@ -2,7 +2,8 @@
  * Persistence layer for RemoteStorageFileSystem caches.
  *
  * Environment-adaptive, zero-dependency storage abstraction:
- *  - Browser:        `localStorage` (synchronous, simple)
+ *  - Browser (with IndexedDB): `IdbCacheStorage` (persistent, large capacity)
+ *  - Browser (without IndexedDB): `localStorage` (synchronous, ~5MB limit)
  *  - Node.js:        JSON file via `node:fs` (path configurable, default
  *                    `<cwd>/.zen-fs-remotestorage-cache.json`)
  *  - Otherwise:      in-memory Map (degrades gracefully, no persistence)
@@ -10,6 +11,8 @@
  * Data is stored namespaced by a key (typically `baseUrl + basePath`) so that
  * multiple RemoteStorage accounts/devices do not collide.
  */
+
+import { IdbKVStore } from 'zen-fs-cache';
 
 export interface CacheStorage {
   /** Load the full persisted map (namespace → JSON-serializable value). */
@@ -24,6 +27,51 @@ function isBrowserLike(): boolean {
     typeof (globalThis as any).localStorage !== 'undefined' &&
     typeof (globalThis as any).window !== 'undefined'
   );
+}
+
+function idbAvailable(): boolean {
+  try {
+    return typeof indexedDB !== 'undefined' && indexedDB !== null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * IndexedDB-backed storage. Uses `IdbKVStore` to store each namespace as a
+ * separate key, providing persistent, high-capacity storage without the ~5MB
+ * limit of `localStorage` or its string-only serialization constraint.
+ *
+ * Falls back gracefully when IndexedDB is unavailable.
+ */
+class IdbCacheStorage implements CacheStorage {
+  private store: IdbKVStore;
+
+  constructor(storageKey: string) {
+    this.store = new IdbKVStore(storageKey, 'cache');
+  }
+
+  async load(): Promise<Record<string, unknown>> {
+    try {
+      const entries = await this.store.entries<unknown>();
+      const result: Record<string, unknown> = {};
+      for (const [key, value] of entries) {
+        result[key] = value;
+      }
+      return result;
+    } catch {
+      return {};
+    }
+  }
+
+  async save(data: Record<string, unknown>): Promise<void> {
+    try {
+      const entries = Object.entries(data).map(([k, v]) => [k, v] as [string, unknown]);
+      await this.store.setMany(entries);
+    } catch {
+      // Non-fatal for a cache.
+    }
+  }
 }
 
 /**
@@ -106,6 +154,12 @@ class MemoryCache implements CacheStorage {
 /**
  * Create a CacheStorage for the given namespace key.
  *
+ * Priority:
+ * 1. IndexedDB (browser, persistent, large capacity) — preferred over localStorage
+ * 2. localStorage (browser, persistent, ~5MB limit)
+ * 3. JSON file (Node.js)
+ * 4. In-memory (fallback)
+ *
  * @param storageKey  Unique key under which the whole cache blob is stored.
  * @param fileOption  Optional explicit file path (Node only). When omitted,
  *                    Node falls back to `<cwd>/.zen-fs-remotestorage-cache.json`.
@@ -114,6 +168,11 @@ export function createCacheStorage(
   storageKey: string,
   fileOption?: string,
 ): CacheStorage {
+  // Prefer IndexedDB in browser environments
+  if (isBrowserLike() && idbAvailable()) {
+    return new IdbCacheStorage(storageKey);
+  }
+
   if (isBrowserLike()) {
     return new LocalStorageCache(storageKey);
   }

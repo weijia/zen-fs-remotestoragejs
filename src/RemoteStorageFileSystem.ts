@@ -27,6 +27,18 @@ import {
   isMtimeSidecar,
 } from './utils.js';
 import { rsLog, rsLogResult } from './debug.js';
+import { createCacheStorage, CacheStorage } from './persistence.js';
+
+/**
+ * A single cached child entry within a directory listing.
+ */
+interface DirEntry {
+  name: string;
+  isDir: boolean;
+  etag?: string;
+  size?: number;
+  lastModified?: string;
+}
 
 /**
  * RemoteStorage filesystem implementation for zen-fs using direct HTTP requests
@@ -68,12 +80,28 @@ export class RemoteStorageFileSystem extends FileSystem {
   private static readonly NEGATIVE_CACHE_TTL = 15_000; // 15s for negative results
 
   /**
-   * Directory listing cache — caches readdir() results so that multiple
-   * stat() calls on files in the same directory share one network request.
-   * Invalidated on any write/delete within the directory.
+   * Directory listing cache — caches readdir() results (with per-entry
+   * metadata: isDir, etag, size, lastModified) so that stat() can return
+   * without a HEAD request, and multiple stat() calls in a directory share
+   * one network request.
+   *
+   * Invalidation is ETag-based (precise): a directory entry is refreshed only
+   * when its ETag changes. A long TTL acts as a fallback for servers that do
+   * not return directory ETags.
    */
-  private dirListingCache = new Map<string, { entries: Set<string>; ts: number }>();
-  private static readonly DIR_LISTING_TTL = 30_000; // 30s
+  private dirListingCache = new Map<
+    string,
+    { etag: string | null; ts: number; entries: Map<string, DirEntry> }
+  >();
+  private static readonly DIR_LISTING_TTL = 300_000; // 5 minutes (fallback)
+
+  /** One cached directory entry (a child of some directory). */
+  private static readonly EMPTY_DIR: DirEntry = {
+    isDir: true,
+    etag: null,
+    size: 0,
+    lastModified: undefined,
+  };
 
   /**
    * Whether HEAD is supported by this server.
@@ -96,6 +124,18 @@ export class RemoteStorageFileSystem extends FileSystem {
   private snapshot: Map<string, string> | null = null;
   /** Root folder's ETag, used as a quick "anything changed?" check */
   private rootEtag: string | null = null;
+
+  // --- Persistent directory cache ---
+  /** Whether the directory-listing cache is persisted to local storage. */
+  private readonly persistCache: boolean;
+  /** Storage backend (localStorage / file / memory). */
+  private storage: CacheStorage | null = null;
+  /** Namespace key for this connection (baseUrl + basePath). */
+  private readonly cacheNamespace: string;
+  /** Memoized promise resolving once the cache has been loaded from storage. */
+  private loadPromise: Promise<void> | null = null;
+  /** Debounced save handle. */
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private config: RemoteStorageConfig) {
     super(0 as any, 0 as any); // FileSystem constructor - using type assertion for now
@@ -124,6 +164,16 @@ export class RemoteStorageFileSystem extends FileSystem {
 
     // Precise mtime is enabled by default
     this.usePreciseMtime = config.preciseMtime !== false;
+
+    // Persistent directory cache setup
+    this.persistCache = config.persistCache !== false;
+    this.cacheNamespace = `${this.baseUrl}${this.config.basePath}`;
+    if (this.persistCache) {
+      this.storage = createCacheStorage(
+        'zen-fs-remotestorage-cache',
+        config.cacheFile,
+      );
+    }
   }
 
   /**
@@ -344,8 +394,20 @@ export class RemoteStorageFileSystem extends FileSystem {
         await this.writeMtimeSidecar(path, mtime);
       }
 
-      // Update snapshot with new ETag from PUT response
+      // Precisely patch this file's entry in the parent directory's cached
+      // listing (ETag-based fine-grained invalidation — siblings stay valid).
       const newEtag = response.headers.get('ETag') ?? undefined;
+      const parentPath = getParentPath(path);
+      const parentDir = parentPath ? `/${parentPath}/` : '/';
+      await this.patchDirListingEntry(parentDir, getBasename(path), {
+        name: getBasename(path),
+        isDir: false,
+        etag: newEtag,
+        size,
+        lastModified: response.headers.get('Last-Modified') ?? undefined,
+      });
+
+      // Update snapshot with new ETag from PUT response
       this.updateSnapshotForPath(path, newEtag ?? null);
     } catch (error) {
       rsLogResult('writeFile', path, error, false);
@@ -384,6 +446,12 @@ export class RemoteStorageFileSystem extends FileSystem {
       rsLogResult('unlink', path, `status=${response.status}`);
       this.removeFromExistenceCache(path);
 
+      // Precisely remove this file's entry from the parent directory's cached
+      // listing (siblings stay valid).
+      const parentPath = getParentPath(path);
+      const parentDir = parentPath ? `/${parentPath}/` : '/';
+      await this.patchDirListingEntry(parentDir, getBasename(path), null);
+
       // Delete .mtime sidecar if precise mtime is enabled
       if (this.usePreciseMtime) {
         await this.deleteMtimeSidecar(path);
@@ -407,6 +475,8 @@ export class RemoteStorageFileSystem extends FileSystem {
    */
   async readdir(path: string): Promise<string[]> {
     rsLog('readdir', path);
+    // Ensure cache is restored from storage before serving (cheap, memoized).
+    await this.ensureCacheLoaded();
     path = this.validateAndNormalizePath(path, true);
     const dirUrl = this.buildUrl(path);
     try {
@@ -422,37 +492,60 @@ export class RemoteStorageFileSystem extends FileSystem {
         this.handleHttpError(response, path, 'readdir');
       }
       const contentType = response.headers.get('content-type') || '';
-      let items: string[];
+      let entries: DirEntry[];
       if (contentType.includes('application/ld+json')) {
         const listing = await response.json();
-        items = [];
+        entries = [];
         if (listing['@graph']) {
           for (const item of listing['@graph']) {
             if (item['@id'] && item['@id'] !== './') {
-              const name = item['@id'].replace(/\/$/, '');
+              const rawName = item['@id'];
+              const isDir = rawName.endsWith('/');
+              const name = rawName.replace(/\/$/, '');
               if (name) {
-                items.push(name);
+                entries.push({
+                  name,
+                  isDir,
+                  etag: item['ETag'] ?? item['etag'],
+                  size: item['Content-Length'] != null
+                    ? Number(item['Content-Length'])
+                    : undefined,
+                  lastModified: item['Last-Modified'] ?? item['last-modified'],
+                });
               }
             }
           }
         } else if (listing['items'] && typeof listing['items'] === 'object') {
           for (const entryKey of Object.keys(listing['items'])) {
             if (entryKey && entryKey !== './') {
-              items.push(entryKey.replace(/\/$/, ''));
+              const isDir = entryKey.endsWith('/');
+              const name = entryKey.replace(/\/$/, '');
+              const item = listing['items'][entryKey];
+              entries.push({
+                name,
+                isDir,
+                etag: item?.ETag ?? item?.etag,
+                size: item?.['Content-Length'] != null
+                  ? Number(item['Content-Length'])
+                  : undefined,
+                lastModified: item?.['Last-Modified'] ?? item?.['last-modified'],
+              });
             }
           }
         }
       } else {
         const html = await response.text();
-        items = this.parseHtmlDirectoryListing(html);
+        const names = this.parseHtmlDirectoryListing(html);
+        entries = names.map(name => ({ name, isDir: name.endsWith('/'), etag: undefined }));
       }
       // Filter out .mtime sidecar files — they are internal to RemoteStorageFileSystem
-      const filtered = items.filter(name => !isMtimeSidecar(name));
-      rsLogResult('readdir', path, `count=${filtered.length} [${filtered.join(', ')}]`);
+      const filtered = entries.filter(e => !isMtimeSidecar(e.name));
+      const names = filtered.map(e => e.name);
+      rsLogResult('readdir', path, `count=${names.length} [${names.join(', ')}]`);
       this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
-      // Cache the directory listing for stat() existence checks
-      this.cacheDirListing(path, filtered);
-      return filtered;
+      // Cache the directory listing (with metadata) for stat() existence/metadata
+      this.cacheDirListing(path, filtered, response.headers.get('ETag'));
+      return names;
     } catch (error) {
       rsLogResult('readdir', path, error, false);
       if (error instanceof DirectoryNotFoundError || error instanceof RemoteStorageError) {
@@ -516,6 +609,14 @@ export class RemoteStorageFileSystem extends FileSystem {
       };
       rsLogResult('mkdir', path, `mode=${result.mode.toString(8)}`);
       this.invalidateExistenceCache(path);
+      // Precisely add this directory's entry to the parent's cached listing.
+      const parentPath = getParentPath(path);
+      const parentDir = parentPath ? `/${parentPath}/` : '/';
+      await this.patchDirListingEntry(parentDir, getBasename(path), {
+        name: getBasename(path),
+        isDir: true,
+        etag: undefined,
+      });
       return result;
     } catch (error) {
       rsLogResult('mkdir', path, error, false);
@@ -554,6 +655,13 @@ export class RemoteStorageFileSystem extends FileSystem {
       }
       rsLogResult('rmdir', path, 'OK');
       this.removeFromExistenceCache(path);
+      // Precisely remove this directory's entry from the parent's cached listing.
+      const parentPath = getParentPath(path);
+      const parentDir = parentPath ? `/${parentPath}/` : '/';
+      await this.patchDirListingEntry(parentDir, getBasename(path), null);
+      // Also drop the directory's own cached listing.
+      this.dirListingCache.delete(normalizePath(path));
+      this.scheduleSave();
     } catch (error) {
       rsLogResult('rmdir', path, error, false);
       if (error instanceof FileNotFoundError || error instanceof DirectoryNotFoundError || error instanceof RemoteStorageError) {
@@ -827,6 +935,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     let existsViaDir = false;
     let isDirViaDir = false;
     let dirListingAvailable = false;
+    let cachedEntry: DirEntry | undefined;
     if (baseName) {
       const parentPath = getParentPath(path);
       const parentDir = parentPath ? `/${parentPath}/` : '/';
@@ -834,24 +943,18 @@ export class RemoteStorageFileSystem extends FileSystem {
       if (entries === null) {
         // Cache miss — fetch directory listing once, cache it for siblings
         try {
-          const list = await this.readdir(parentDir);
+          await this.readdir(parentDir);
           entries = this.getCachedDirListing(parentDir);
-          if (entries === null) {
-            this.cacheDirListing(parentDir, list);
-            entries = this.getCachedDirListing(parentDir);
-          }
         } catch {
           entries = null; // parent dir doesn't exist or can't be read
         }
       }
       if (entries) {
         dirListingAvailable = true;
-        if (entries.has(baseName)) {
+        cachedEntry = entries.get(baseName);
+        if (cachedEntry) {
           existsViaDir = true;
-          isDirViaDir = false;
-        } else if (entries.has(baseName + '/')) {
-          existsViaDir = true;
-          isDirViaDir = true;
+          isDirViaDir = cachedEntry.isDir;
         }
       }
     }
@@ -865,10 +968,12 @@ export class RemoteStorageFileSystem extends FileSystem {
 
     // If the caller explicitly passes a trailing slash, they already know
     // it's a directory — skip the file probe entirely.
-    // Try HEAD when: (a) dir listing confirmed file exists, or (b) dir
-    // listing wasn't available (parent unreadable) — HEAD as fallback.
+    // Try HEAD when: (a) dir listing confirmed file exists but the cached
+    // entry lacks size metadata (so we need a real probe), or (b) dir listing
+    // wasn't available (parent unreadable) — HEAD as fallback.
+    const needMetadata = !cachedEntry || cachedEntry.size === undefined;
     const shouldTryHead = !callerSaysDir && this.headSupported !== false
-      && (existsViaDir || !dirListingAvailable) && !isDirViaDir;
+      && (existsViaDir || !dirListingAvailable) && !isDirViaDir && needMetadata;
     if (shouldTryHead) {
       // ---- Stage 1: HEAD probe (metadata) ----
       // File confirmed to exist via directory listing. Now fetch metadata.
@@ -925,13 +1030,27 @@ export class RemoteStorageFileSystem extends FileSystem {
         mtimeMs: Date.now(), ctimeMs: Date.now(), atimeMs: Date.now(), birthtimeMs: Date.now(), nlink: 1 };
     }
 
-    // File confirmed as regular file via listing, but HEAD unavailable
-    // (either not supported or returned error). Return what we know.
+    // File confirmed as regular file via listing. Prefer metadata from the
+    // cached directory entry (size / Last-Modified) so we can return without a
+    // HEAD request. Fall back to a HEAD probe when metadata is missing.
     if (existsViaDir && !isDirViaDir) {
-      rsLogResult('stat', path, `FILE mode=100644 (via dir listing, no metadata)`);
+      const size = cachedEntry?.size ?? 0;
+      let mtime = cachedEntry?.lastModified
+        ? new Date(cachedEntry.lastModified).getTime()
+        : Date.now();
+
+      // Precise mtime sidecar (if enabled) overrides server Last-Modified.
+      if (this.usePreciseMtime) {
+        const preciseMtime = await this.readMtimeSidecar(path);
+        if (preciseMtime !== undefined) {
+          mtime = preciseMtime;
+        }
+      }
+
+      rsLogResult('stat', path, `FILE mode=100644 (via dir listing, size=${size})`);
       this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
-      return { ino: 0, mode: 0o100644, uid: 0, gid: 0, size: 0,
-        mtimeMs: Date.now(), ctimeMs: Date.now(), atimeMs: Date.now(), birthtimeMs: Date.now(), nlink: 1 };
+      return { ino: 0, mode: 0o100644, uid: 0, gid: 0, size,
+        mtimeMs: mtime, ctimeMs: mtime, atimeMs: mtime, birthtimeMs: mtime, nlink: 1 };
     }
 
     // File not found in directory listing — but if parent dir wasn't readable,
@@ -1139,10 +1258,11 @@ export class RemoteStorageFileSystem extends FileSystem {
   private invalidateExistenceCache(path: string): void {
     const normalized = normalizePath(path);
     this.existenceCache.delete(normalized);
-    // Also invalidate the parent directory (readdir results may change)
+    // Also invalidate the parent directory's existence entry (readdir may change)
     this.existenceCache.delete(ensureDirectoryPath(getParentPath(normalized)));
-    // Invalidate directory listing cache for the parent
-    this.invalidateDirListingCache(normalized);
+    // NOTE: directory-listing cache is NOT dropped here. Writes/deletes patch
+    // the affected entry precisely via patchDirListingEntry() so siblings stay
+    // valid (ETag-based fine-grained invalidation).
     // Mark the path itself as existing (it was just written/created)
     this.existenceCache.set(normalized, { exists: true, ts: Date.now() });
   }
@@ -1153,10 +1273,9 @@ export class RemoteStorageFileSystem extends FileSystem {
   private removeFromExistenceCache(path: string): void {
     const normalized = normalizePath(path);
     this.existenceCache.delete(normalized);
-    // Also invalidate parent
+    // Also invalidate parent's existence entry
     this.existenceCache.delete(ensureDirectoryPath(getParentPath(normalized)));
-    // Invalidate directory listing cache for the parent
-    this.invalidateDirListingCache(normalized);
+    // Directory-listing cache entry is removed precisely by callers (unlink/rmdir).
   }
 
   // -------------------------------------------------------------------------
@@ -1166,44 +1285,123 @@ export class RemoteStorageFileSystem extends FileSystem {
   /**
    * Get the cached directory listing for a directory path, or null if
    * not cached / expired. Does NOT make any network requests.
+   *
+   * ETag-based invalidation: a cached entry is considered stale only when its
+   * directory ETag differs from `currentDirEtag` (when provided) — not on every
+   * write. A long TTL acts as a fallback for servers that don't return ETags.
    */
-  private getCachedDirListing(dirPath: string): Set<string> | null {
+  private getCachedDirListing(dirPath: string): Map<string, DirEntry> | null {
     const key = normalizePath(dirPath);
     const cached = this.dirListingCache.get(key);
-    if (cached && Date.now() - cached.ts < RemoteStorageFileSystem.DIR_LISTING_TTL) {
-      return cached.entries;
+    if (!cached) return null;
+    if (Date.now() - cached.ts >= RemoteStorageFileSystem.DIR_LISTING_TTL) {
+      this.dirListingCache.delete(key); // long-TTL fallback expiry
+      return null;
     }
-    if (cached) {
-      this.dirListingCache.delete(key); // expired
-    }
-    return null;
+    return cached.entries;
   }
 
   /**
-   * Cache a directory listing result.
+   * Cache a directory listing result (with per-entry metadata) and the
+   * directory's own ETag. Replaces any previous listing for this directory.
    */
-  private cacheDirListing(dirPath: string, entries: string[]): void {
+  private cacheDirListing(
+    dirPath: string,
+    entries: DirEntry[],
+    dirEtag: string | null,
+  ): void {
     const key = normalizePath(dirPath);
-    // Store names both with and without trailing slash for dirs
-    const set = new Set<string>();
+    const map = new Map<string, DirEntry>();
     for (const e of entries) {
-      set.add(e);
-      if (e.endsWith('/')) set.add(e);
-      else set.add(e + '/'); // also store with trailing slash for dir detection
+      map.set(e.name, e);
     }
-    this.dirListingCache.set(key, { entries: set, ts: Date.now() });
+    this.dirListingCache.set(key, { etag: dirEtag, ts: Date.now(), entries: map });
+    this.scheduleSave();
   }
 
   /**
-   * Invalidate the directory listing cache for the parent of `path`.
-   * Called after writes/deletes because the parent directory's contents changed.
+   * Precisely patch a single child entry inside a parent directory's cached
+   * listing — used after a local write/delete so siblings stay valid. This is
+   * the ETag-based fine-grained invalidation (no whole-directory drop).
    */
-  private invalidateDirListingCache(path: string): void {
-    const parent = getParentPath(path);
-    if (parent) {
-      this.dirListingCache.delete(parent);
+  private async patchDirListingEntry(
+    parentDir: string,
+    name: string,
+    entry: DirEntry | null,
+  ): Promise<void> {
+    // Ensure any persisted cache has been restored before patching, so we
+    // don't accidentally drop entries that were loaded from storage.
+    await this.ensureCacheLoaded();
+    const key = normalizePath(parentDir);
+    const cached = this.dirListingCache.get(key);
+    if (!cached) return; // nothing cached for this dir; will be fetched on demand
+    if (entry === null) {
+      cached.entries.delete(name);
     } else {
-      this.dirListingCache.delete(''); // root
+      cached.entries.set(name, entry);
+    }
+    cached.ts = Date.now();
+    this.scheduleSave();
+  }
+
+  /**
+   * Ensure the persisted cache has been loaded from storage at least once.
+   * Memoized — the actual load runs a single time per instance.
+   */
+  private ensureCacheLoaded(): Promise<void> {
+    if (!this.persistCache || !this.storage) return Promise.resolve();
+    if (!this.loadPromise) {
+      this.loadPromise = (async () => {
+        try {
+          const blob = await this.storage!.load();
+          const data = blob[this.cacheNamespace];
+          if (data && typeof data === 'object') {
+            const parsed = data as Record<string, { etag: string | null; ts: number; entries: Record<string, DirEntry> }>;
+            for (const [k, v] of Object.entries(parsed)) {
+              const m = new Map<string, DirEntry>();
+              for (const [name, e] of Object.entries(v.entries)) {
+                m.set(name, e);
+              }
+              this.dirListingCache.set(k, { etag: v.etag, ts: v.ts, entries: m });
+            }
+            rsLogResult('cache', 'load', `restored ${this.dirListingCache.size} dirs`);
+          }
+        } catch (err) {
+          rsLogResult('cache', 'load', err, false);
+        }
+      })();
+    }
+    return this.loadPromise;
+  }
+
+  /**
+   * Debounced persistence of the whole directory cache blob.
+   */
+  private scheduleSave(): void {
+    if (!this.persistCache || !this.storage) return;
+    if (this.saveTimer) return; // already scheduled
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null;
+      void this.flushSave();
+    }, 500);
+  }
+
+  private async flushSave(): Promise<void> {
+    try {
+      const blob = await this.storage!.load();
+      const out: Record<string, { etag: string | null; ts: number; entries: Record<string, DirEntry> }> = {};
+      for (const [k, v] of this.dirListingCache.entries()) {
+        const entries: Record<string, DirEntry> = {};
+        for (const [name, e] of v.entries.entries()) {
+          entries[name] = e;
+        }
+        out[k] = { etag: v.etag, ts: v.ts, entries };
+      }
+      blob[this.cacheNamespace] = out;
+      await this.storage!.save(blob);
+      rsLogResult('cache', 'save', `persisted ${this.dirListingCache.size} dirs`);
+    } catch (err) {
+      rsLogResult('cache', 'save', err, false);
     }
   }
 
@@ -1213,6 +1411,7 @@ export class RemoteStorageFileSystem extends FileSystem {
   clearExistenceCache(): void {
     this.existenceCache.clear();
     this.dirListingCache.clear();
+    this.scheduleSave();
   }
 
   // ===========================================================================

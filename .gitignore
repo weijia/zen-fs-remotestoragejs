@@ -65,3 +65,5 @@ playwright-report/
 
 # Local package tarballs
 *.tgz
+result.txt
+vitest_out.txt

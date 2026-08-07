@@ -36,6 +36,23 @@ export interface RemoteStorageConfig {
    * to upper layers.
    */
   preciseMtime?: boolean;
+
+  /**
+   * Enable persistence of the directory-listing cache to local storage.
+   * Default: true. When enabled, the cache (with ETag-based invalidation) is
+   * restored on startup and written back on changes, so most stat()/readdir()
+   * calls need zero network requests after a warm start.
+   *
+   * - Browser: uses `localStorage`.
+   * - Node.js: uses a JSON file (see `cacheFile`).
+   */
+  persistCache?: boolean;
+
+  /**
+   * Explicit file path for the persisted cache when running under Node.js.
+   * Defaults to `<cwd>/.zen-fs-remotestorage-cache.json`. Ignored in browsers.
+   */
+  cacheFile?: string;
 }
 
 /**

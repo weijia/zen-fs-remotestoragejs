@@ -434,10 +434,33 @@ export class RemoteStorageFileSystem extends FileSystem {
 
   /**
    * Delete file
+   *
+   * Before sending the HTTP DELETE, check the existence cache and fall back
+   * to a lightweight HEAD/readdir check.  If the file is already absent we
+   * skip the DELETE request entirely — this is important for tombstone-driven
+   * deletes where the file may have already been removed on a previous cycle.
    */
   async unlink(path: string): Promise<void> {
     rsLog('unlink', path);
     path = this.validateAndNormalizePath(path);
+
+    // Quick check: if we already know the file doesn't exist (from cache or
+    // a recent stat), skip the DELETE request entirely.
+    const normalized = normalizePath(path);
+    const cached = this.existenceCache.get(normalized);
+    if (cached && !cached.exists) {
+      if (Date.now() - cached.ts < RemoteStorageFileSystem.NEGATIVE_CACHE_TTL) {
+        rsLogResult('unlink', path, 'skipped (cached as non-existent)');
+        return;
+      }
+    }
+    // Cache miss or stale — do a real exists() check (uses HEAD or readdir,
+    // both cached) to avoid a wasteful 404 DELETE.
+    if (!(await this.exists(path))) {
+      rsLogResult('unlink', path, 'skipped (file does not exist)');
+      return;
+    }
+
     try {
       const url = this.buildUrl(path);
       const response = await this.makeRequest(url, { method: 'DELETE' });

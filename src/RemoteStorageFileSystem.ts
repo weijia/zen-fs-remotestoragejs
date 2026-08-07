@@ -97,6 +97,7 @@ export class RemoteStorageFileSystem extends FileSystem {
 
   /** One cached directory entry (a child of some directory). */
   private static readonly EMPTY_DIR: DirEntry = {
+    name: '',
     isDir: true,
     etag: null,
     size: 0,
@@ -367,7 +368,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         body = data;
         contentType = 'text/plain; charset=utf-8';
       } else if (data instanceof Uint8Array) {
-        body = data;
+        body = data as unknown as BodyInit;
         contentType = 'application/octet-stream';
       } else if (data instanceof ArrayBuffer) {
         body = data;

@@ -449,18 +449,59 @@ export class RemoteStorageFileSystem extends FileSystem {
   /**
    * Delete file.
    *
-   * Existence check before deletion is handled centrally by
-   * zen-fs-config's processTombstones() via safeExists(), so this method
-   * simply sends the DELETE request. Individual backends do not need to
-   * duplicate the check.
+   * Pre-DELETE existence check:
+   * 1. Check existence cache and cached directory listing (zero network cost).
+   *    If either definitively says the file doesn't exist, skip the DELETE
+   *    entirely — avoids 404 errors on remote backends.
+   * 2. If cache is inconclusive, send the DELETE. A 404 response is treated
+   *    as success (DELETE is idempotent in REST semantics — the resource is
+   *    already gone, which is the desired end state).
    */
   async unlink(path: string): Promise<void> {
     rsLog('unlink', path);
     path = this.validateAndNormalizePath(path);
+    const normalized = normalizePath(path);
+
+    // --- Pre-DELETE cache check (zero network cost) ---
+    // 1a. Check existence cache
+    const existCached = this.existenceCache.get(normalized);
+    if (existCached && !existCached.exists) {
+      if (Date.now() - existCached.ts < RemoteStorageFileSystem.NEGATIVE_CACHE_TTL) {
+        rsLogResult('unlink', path, 'skipped (existence cache: not found)');
+        return;
+      }
+    }
+
+    // 1b. Check cached parent directory listing
+    const baseName = getBasename(path);
+    if (baseName) {
+      const parentPath = getParentPath(path);
+      const parentDir = parentPath ? `/${parentPath}/` : '/';
+      const dirEntries = this.getCachedDirListing(parentDir);
+      if (dirEntries !== null && !dirEntries.has(baseName)) {
+        rsLogResult('unlink', path, 'skipped (not in dir listing cache)');
+        return;
+      }
+    }
 
     try {
       const url = this.buildUrl(path);
       const response = await this.makeRequest(url, { method: 'DELETE' });
+
+      // 404 on DELETE = file already gone = success (idempotent)
+      if (response.status === 404) {
+        rsLogResult('unlink', path, '404 — already deleted, treating as success');
+        this.removeFromExistenceCache(path);
+        const parentPath = getParentPath(path);
+        const parentDir = parentPath ? `/${parentPath}/` : '/';
+        await this.patchDirListingEntry(parentDir, getBasename(path), null);
+        if (this.usePreciseMtime) {
+          await this.deleteMtimeSidecar(path);
+        }
+        this.updateSnapshotForPath(path, null);
+        return;
+      }
+
       if (!response.ok) {
         this.handleHttpError(response, path, 'unlink');
       }
@@ -1604,8 +1645,42 @@ export class RemoteStorageFileSystem extends FileSystem {
    */
   private async deleteMtimeSidecar(filePath: string): Promise<void> {
     const sidecarPath = mtimePathFor(filePath);
-    const sidecarUrl = this.buildUrl(sidecarPath);
     const normalized = normalizePath(filePath);
+
+    // Check if the sidecar file exists before sending a DELETE request.
+    // Uses the same cache-checking logic as readMtimeSidecar() to avoid
+    // spurious 404 errors in the browser console.
+    const lastSlash = sidecarPath.lastIndexOf('/');
+    const sidecarDir = lastSlash >= 0 ? sidecarPath.slice(0, lastSlash) : '';
+    const sidecarName = lastSlash >= 0 ? sidecarPath.slice(lastSlash + 1) : sidecarPath;
+
+    // 1. If we have a cached dir listing and the sidecar isn't in it, skip.
+    if (sidecarDir) {
+      const dirEntries = this.getCachedDirListing(sidecarDir);
+      if (dirEntries !== null && !dirEntries.has(sidecarName)) {
+        this.mtimeCache.delete(normalized);
+        this.mtimeStore.delete(normalized).catch(() => {});
+        rsLogResult('deleteMtimeSidecar', filePath, 'skipped (not in dir listing)');
+        return;
+      }
+    }
+
+    // 2. If in-memory or IndexedDB cache has no entry, the sidecar was
+    //    likely never written — skip the network DELETE.
+    const memCached = this.mtimeCache.get(normalized);
+    const idbCached = await this.mtimeStore.get<number>(normalized);
+    if (memCached === undefined && idbCached === undefined) {
+      // Still try the DELETE if the dir listing wasn't available —
+      // the sidecar might exist on the server from a previous session.
+      if (sidecarDir) {
+        this.mtimeCache.delete(normalized);
+        this.mtimeStore.delete(normalized).catch(() => {});
+        rsLogResult('deleteMtimeSidecar', filePath, 'skipped (no cache, dir listing unavailable)');
+        return;
+      }
+    }
+
+    const sidecarUrl = this.buildUrl(sidecarPath);
     try {
       const response = await this.makeRequest(sidecarUrl, { method: 'DELETE' });
       if (response.ok || response.status === 404) {

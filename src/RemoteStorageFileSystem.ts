@@ -1191,28 +1191,52 @@ export class RemoteStorageFileSystem extends FileSystem {
     // listing (same technique as stat() Stage 0).
     const baseName = getBasename(path);
     let isDir = path === '/' || path.endsWith('/');
+    let dirCheckSource = isDir ? 'trailing-slash' : 'none';
+
     if (!isDir && baseName) {
       const parentPath = getParentPath(path);
       const parentDir = parentPath ? `/${parentPath}/` : '/';
       const entries = this.getCachedDirListing(parentDir);
+      rsLog('getRevision', path, {
+        dirCheck: 'looking-up-parent',
+        parentDir,
+        hasCache: entries !== null,
+        cacheKeys: entries ? [...entries.keys()] : null,
+      });
       if (entries) {
         const entry = entries.get(baseName);
-        if (entry?.isDir) isDir = true;
+        rsLog('getRevision', path, {
+          dirCheck: 'parent-cache-hit',
+          baseName,
+          found: !!entry,
+          isDir: entry?.isDir,
+        });
+        if (entry?.isDir) {
+          isDir = true;
+          dirCheckSource = 'parent-listing';
+        }
+      } else {
+        rsLog('getRevision', path, { dirCheck: 'parent-cache-miss' });
       }
     }
 
     const effectivePath = isDir && !path.endsWith('/') ? path + '/' : path;
     const url = this.buildUrl(effectivePath);
+    rsLog('getRevision', path, {
+      isDir, dirCheckSource, effectivePath, url,
+    });
 
     try {
       let response = await this.makeRequest(url, { method: 'HEAD' });
+      rsLog('getRevision', path, { firstAttemptStatus: response.status });
 
       // Fallback: if we got a 404 and didn't use a trailing slash, the path
       // might still be a directory whose listing wasn't cached. Retry with '/'.
       if (response.status === 404 && !effectivePath.endsWith('/')) {
         const dirUrl = this.buildUrl(effectivePath + '/');
-        rsLog('getRevision', path, { retryingWithTrailingSlash: true });
+        rsLog('getRevision', path, { retryingWithTrailingSlash: true, dirUrl });
         response = await this.makeRequest(dirUrl, { method: 'HEAD' });
+        rsLog('getRevision', path, { retryStatus: response.status });
       }
 
       if (!response.ok) {

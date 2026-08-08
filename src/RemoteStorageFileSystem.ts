@@ -470,40 +470,22 @@ export class RemoteStorageFileSystem extends FileSystem {
     const normalized = normalizePath(path);
 
     // --- Pre-DELETE cache check (zero network cost) ---
-    // 1a. Check existence cache
+    // Only skip DELETE when we have DEFINITIVE proof the file doesn't exist:
+    // existenceCache says not-found AND is within TTL.
+    // Never skip based on dir listing alone — it may be stale.
+    // If unsure, just send DELETE — 404 is handled as success (idempotent).
     const existCached = this.existenceCache.get(normalized);
     console.log(`[RS-TRACE] unlink(${path}) normalized=${normalized} existenceCache → ${existCached ? `exists=${existCached.exists} age=${Date.now() - existCached.ts}ms` : 'MISS'}`);
-    if (!existCached) {
-      console.log(`[RS-TRACE] unlink(${path}): existenceCache MISS — caller stack:`);
-      console.trace();
-    }
     if (existCached && !existCached.exists) {
       if (Date.now() - existCached.ts < RemoteStorageFileSystem.NEGATIVE_CACHE_TTL) {
         console.log(`[RS-TRACE] unlink(${path}): SKIPPED (existence cache: not found, within TTL)`);
         rsLogResult('unlink', path, 'skipped (existence cache: not found)');
         return;
       }
-      console.log(`[RS-TRACE] unlink(${path}): negative cache expired, proceeding`);
+      console.log(`[RS-TRACE] unlink(${path}): negative cache expired, proceeding to DELETE`);
     }
 
-    // 1b. Check cached parent directory listing
-    //     Only skip if existenceCache doesn't already say the file EXISTS.
-    //     When existenceCache has a positive entry, it's more recent and
-    //     authoritative — the dir listing may be stale.
-    const baseName = getBasename(path);
-    if (baseName && !(existCached && existCached.exists)) {
-      const parentPath = getParentPath(path);
-      const parentDir = parentPath ? `/${parentPath}/` : '/';
-      const dirEntries = this.getCachedDirListing(parentDir);
-      console.log(`[RS-TRACE] unlink(${path}): dir listing cache for ${parentDir} → ${dirEntries ? `${dirEntries.size} entries, has(${baseName})=${dirEntries.has(baseName)}` : 'MISS'}`);
-      if (dirEntries !== null && !dirEntries.has(baseName)) {
-        console.log(`[RS-TRACE] unlink(${path}): SKIPPED (not in dir listing cache)`);
-        rsLogResult('unlink', path, 'skipped (not in dir listing cache)');
-        return;
-      }
-    }
-
-    console.log(`[RS-TRACE] unlink(${path}): cache check passed, sending DELETE`);
+    console.log(`[RS-TRACE] unlink(${path}): sending DELETE`);
     try {
       const url = this.buildUrl(path);
       const response = await this.makeRequest(url, { method: 'DELETE' });

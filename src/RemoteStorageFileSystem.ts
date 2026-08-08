@@ -487,8 +487,11 @@ export class RemoteStorageFileSystem extends FileSystem {
     }
 
     // 1b. Check cached parent directory listing
+    //     Only skip if existenceCache doesn't already say the file EXISTS.
+    //     When existenceCache has a positive entry, it's more recent and
+    //     authoritative — the dir listing may be stale.
     const baseName = getBasename(path);
-    if (baseName) {
+    if (baseName && !(existCached && existCached.exists)) {
       const parentPath = getParentPath(path);
       const parentDir = parentPath ? `/${parentPath}/` : '/';
       const dirEntries = this.getCachedDirListing(parentDir);

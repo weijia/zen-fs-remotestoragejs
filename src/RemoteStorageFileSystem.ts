@@ -79,6 +79,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    */
   private existenceCache = new Map<string, { exists: boolean; ts: number }>();
   private static readonly NEGATIVE_CACHE_TTL = 15_000; // 15s for negative results
+  private static readonly POSITIVE_CACHE_TTL = 10_000; // 10s for positive results
 
   /**
    * Directory listing cache — caches readdir() results (with per-entry
@@ -304,13 +305,19 @@ export class RemoteStorageFileSystem extends FileSystem {
     const cached = this.existenceCache.get(normalized);
     if (cached) {
       if (cached.exists) {
-        rsLogResult('exists', path, true, true);
-        return true;
-      }
-      // Negative result: respect TTL
-      if (Date.now() - cached.ts < RemoteStorageFileSystem.NEGATIVE_CACHE_TTL) {
-        rsLogResult('exists', path, false, true);
-        return false;
+        // Positive result: respect TTL — file may have been deleted
+        // externally (by another client or sync cycle) since we last checked.
+        if (Date.now() - cached.ts < RemoteStorageFileSystem.POSITIVE_CACHE_TTL) {
+          rsLogResult('exists', path, true, true);
+          return true;
+        }
+        // Positive cache expired — fall through to fresh stat() check
+      } else {
+        // Negative result: respect TTL
+        if (Date.now() - cached.ts < RemoteStorageFileSystem.NEGATIVE_CACHE_TTL) {
+          rsLogResult('exists', path, false, true);
+          return false;
+        }
       }
     }
 

@@ -1024,22 +1024,24 @@ export class RemoteStorageFileSystem extends FileSystem {
     let isDirViaDir = false;
     let dirListingAvailable = false;
     let cachedEntry: DirEntry | undefined;
+    let dirListingAge: number | null = null;
     if (baseName) {
       const parentPath = getParentPath(path);
       const parentDir = parentPath ? `/${parentPath}/` : '/';
       let entries = this.getCachedDirListing(parentDir);
-      const listingAge = this.getDirListingAge(parentDir);
-      console.log(`[RS-STAT] stat(${path}): dir listing cache for ${parentDir} → ${entries ? `${entries.size} entries, age=${listingAge}ms` : 'MISS'}`);
+      dirListingAge = this.getDirListingAge(parentDir);
+      console.log(`[RS-STAT] stat(${path}): dir listing cache for ${parentDir} → ${entries ? `${entries.size} entries, age=${dirListingAge}ms` : 'MISS'}`);
       if (entries === null) {
         // Cache miss — fetch directory listing once, cache it for siblings
         try {
           console.log(`[RS-STAT] stat(${path}): fetching readdir(${parentDir})`);
           await this.readdir(parentDir);
           entries = this.getCachedDirListing(parentDir);
-          const newAge = this.getDirListingAge(parentDir);
-          console.log(`[RS-STAT] stat(${path}): readdir returned, cache now → ${entries ? `${entries.size} entries, age=${newAge}ms` : 'still MISS'}`);
+          dirListingAge = this.getDirListingAge(parentDir);
+          console.log(`[RS-STAT] stat(${path}): readdir returned, cache now → ${entries ? `${entries.size} entries, age=${dirListingAge}ms` : 'still MISS'}`);
         } catch {
           entries = null; // parent dir doesn't exist or can't be read
+          dirListingAge = null;
           console.log(`[RS-STAT] stat(${path}): readdir(${parentDir}) FAILED`);
         }
       }
@@ -1049,9 +1051,9 @@ export class RemoteStorageFileSystem extends FileSystem {
         if (cachedEntry) {
           existsViaDir = true;
           isDirViaDir = cachedEntry.isDir;
-          console.log(`[RS-STAT] stat(${path}): FOUND in dir listing (isDir=${isDirViaDir}, size=${cachedEntry.size ?? 'undefined'})`);
+          console.log(`[RS-STAT] stat(${path}): FOUND in dir listing (isDir=${isDirViaDir}, size=${cachedEntry.size ?? 'undefined'}, listingAge=${dirListingAge}ms)`);
         } else {
-          console.log(`[RS-STAT] stat(${path}): NOT in dir listing (entries: ${[...entries.keys()].join(', ')})`);
+          console.log(`[RS-STAT] stat(${path}): NOT in dir listing (entries: ${[...entries.keys()].join(', ')}, listingAge=${dirListingAge}ms)`);
         }
       }
     }
@@ -1064,18 +1066,30 @@ export class RemoteStorageFileSystem extends FileSystem {
     // cached. To avoid false "not found" results, we only short-circuit when
     // the listing is FRESH (within POSITIVE_CACHE_TTL = 10s). For stale
     // listings, we fall through to a HEAD probe to verify with the server.
+    //
+    // Similarly, when the file IS in a stale listing, we cannot trust it —
+    // the file may have been deleted externally (by another client, a
+    // previous tombstone cleanup, or a sync cycle). Only trust the listing
+    // when it's FRESH.
+    const dirListingIsStale = dirListingAge !== null
+      && dirListingAge >= RemoteStorageFileSystem.POSITIVE_CACHE_TTL;
+
     if (dirListingAvailable && !existsViaDir && !callerSaysDir) {
-      const parentPath = getParentPath(path);
-      const parentDir = parentPath ? `/${parentPath}/` : '/';
-      const listingAge = this.getDirListingAge(parentDir);
-      if (listingAge !== null && listingAge < RemoteStorageFileSystem.POSITIVE_CACHE_TTL) {
-        console.log(`[RS-STAT] stat(${path}): → FileNotFoundError (not in FRESH dir listing, age=${listingAge}ms < ${RemoteStorageFileSystem.POSITIVE_CACHE_TTL}ms)`);
+      if (dirListingAge !== null && dirListingAge < RemoteStorageFileSystem.POSITIVE_CACHE_TTL) {
+        console.log(`[RS-STAT] stat(${path}): → FileNotFoundError (not in FRESH dir listing, age=${dirListingAge}ms < ${RemoteStorageFileSystem.POSITIVE_CACHE_TTL}ms)`);
         rsLogResult('stat', path, 'FileNotFoundError (not in fresh dir listing)', false);
         throw new FileNotFoundError(path);
       }
       // Listing is stale — file might have been created externally.
       // Fall through to HEAD probe to verify.
-      console.log(`[RS-STAT] stat(${path}): not in STALE dir listing (age=${listingAge}ms >= ${RemoteStorageFileSystem.POSITIVE_CACHE_TTL}ms), falling through to HEAD probe`);
+      console.log(`[RS-STAT] stat(${path}): not in STALE dir listing (age=${dirListingAge}ms >= ${RemoteStorageFileSystem.POSITIVE_CACHE_TTL}ms), falling through to HEAD probe`);
+    }
+
+    if (existsViaDir && dirListingIsStale && !callerSaysDir && !isDirViaDir) {
+      console.log(`[RS-STAT] stat(${path}): FOUND in dir listing but listing is STALE (age=${dirListingAge}ms >= ${RemoteStorageFileSystem.POSITIVE_CACHE_TTL}ms), will verify via HEAD`);
+      // Don't trust the stale listing — fall through to HEAD probe.
+      // Pretend we don't have dir listing info so shouldTryHead triggers.
+      existsViaDir = false;
     }
 
     // If the caller explicitly passes a trailing slash, they already know
@@ -1085,7 +1099,11 @@ export class RemoteStorageFileSystem extends FileSystem {
     //   (b) dir listing wasn't available (parent unreadable) — HEAD as fallback
     //   (c) dir listing was available but STALE and file not in it — verify
     //       with server before declaring not-found (prevents cache inconsistency)
-    const needMetadata = !cachedEntry || cachedEntry.size === undefined;
+    //   (d) dir listing was available but STALE and file WAS in it — verify
+    //       with server before declaring found (prevents false positive)
+    //   In cases (c) and (d), existsViaDir has been set to false above, so
+    //   we need to force needMetadata=true to ensure HEAD fires.
+    const needMetadata = !cachedEntry || cachedEntry.size === undefined || !existsViaDir;
     const shouldTryHead = !callerSaysDir && this.headSupported !== false
       && !isDirViaDir && needMetadata;
     console.log(`[RS-STAT] stat(${path}): shouldTryHead=${shouldTryHead} (callerSaysDir=${callerSaysDir} headSupported=${this.headSupported} isDirViaDir=${isDirViaDir} needMetadata=${needMetadata})`);

@@ -1005,6 +1005,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    */
   async stat(path: string): Promise<InodeLike> {
     rsLog('stat', path);
+    console.log(`[RS-TRACE] stat ENTER(${path})`);
     if (!isValidPath(path)) {
       rsLogResult('stat', path, 'Invalid path format', false);
       throw new RemoteStorageError('Invalid path format');
@@ -1095,6 +1096,7 @@ export class RemoteStorageFileSystem extends FileSystem {
               size, mtimeMs: mtime, ctimeMs: mtime, atimeMs: mtime, birthtimeMs: mtime, nlink: 1,
             };
             rsLogResult('stat', path, `FILE mode=${result.mode.toString(8)} size=${size}`);
+            console.log(`[RS-TRACE] stat(${path}): returning via HEAD OK, setting existenceCache`);
             this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
             return result;
           }
@@ -1106,6 +1108,7 @@ export class RemoteStorageFileSystem extends FileSystem {
           this.handleHttpError(response, path, 'stat');
         }
         rsLog('stat', path, { headStatus: response.status, fallingThrough: 'readdir stat' });
+        console.log(`[RS-TRACE] stat(${path}): HEAD status=${response.status}, falling through to stage 2`);
       } catch (error) {
         if (error instanceof AuthenticationError || error instanceof PermissionDeniedError) {
           throw error;
@@ -1119,6 +1122,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     // File confirmed as directory via listing
     if (existsViaDir && isDirViaDir) {
       rsLogResult('stat', path, `DIR mode=40755 (via dir listing)`);
+      console.log(`[RS-TRACE] stat(${path}): returning via dir listing (isDir), setting existenceCache`);
       this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
       return { ino: 0, mode: 0o040755, uid: 0, gid: 0, size: 0,
         mtimeMs: Date.now(), ctimeMs: Date.now(), atimeMs: Date.now(), birthtimeMs: Date.now(), nlink: 1 };
@@ -1142,6 +1146,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       }
 
       rsLogResult('stat', path, `FILE mode=100644 (via dir listing, size=${size})`);
+      console.log(`[RS-TRACE] stat(${path}): returning via dir listing (file, size=${size}), setting existenceCache`);
       this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
       return { ino: 0, mode: 0o100644, uid: 0, gid: 0, size,
         mtimeMs: mtime, ctimeMs: mtime, atimeMs: mtime, birthtimeMs: mtime, nlink: 1 };
@@ -1160,6 +1165,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         const contentType = response.headers.get('content-type') || '';
         if (contentType.includes('application/ld+json') || contentType.includes('text/html')) {
           rsLogResult('stat', path, `DIR mode=40755 (via dir probe)`);
+          console.log(`[RS-TRACE] stat(${path}): returning via dir probe, setting existenceCache`);
           this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
           return { ino: 0, mode: 0o040755, uid: 0, gid: 0, size: 0,
             mtimeMs: Date.now(), ctimeMs: Date.now(), atimeMs: Date.now(), birthtimeMs: Date.now(), nlink: 1 };
@@ -1175,6 +1181,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     }
 
     rsLogResult('stat', path, 'FileNotFoundError', false);
+    console.log(`[RS-TRACE] stat(${path}): → FileNotFoundError (all paths exhausted)`);
     throw new FileNotFoundError(path);
   }
 

@@ -1174,13 +1174,47 @@ export class RemoteStorageFileSystem extends FileSystem {
    * `zen-fs-cache` for cheap revalidation of `readdir` / `stat` and as a
    * fallback for `readFile`. Prefers the `ETag`, falling back to
    * `Last-Modified` (HTTP-date string).
+   *
+   * RemoteStorage servers require a trailing '/' for directory URLs; a HEAD
+   * on a directory path without the slash returns 404.  To avoid this we:
+   *   1. Check the cached parent-dir listing — if it says the path is a
+   *      directory, append '/' before building the URL.
+   *   2. If no listing is cached, try the URL as-is first; on 404 retry
+   *      with a trailing '/' (covers the case where the caller passes a
+   *      directory path without a slash).
    */
   async getRevision(path: string): Promise<string | number | undefined> {
     rsLog('getRevision', path);
     path = this.validateAndNormalizePath(path);
-    const url = this.buildUrl(path);
+
+    // Determine whether the path is a directory using the cached parent
+    // listing (same technique as stat() Stage 0).
+    const baseName = getBasename(path);
+    let isDir = path === '/' || path.endsWith('/');
+    if (!isDir && baseName) {
+      const parentPath = getParentPath(path);
+      const parentDir = parentPath ? `/${parentPath}/` : '/';
+      const entries = this.getCachedDirListing(parentDir);
+      if (entries) {
+        const entry = entries.get(baseName);
+        if (entry?.isDir) isDir = true;
+      }
+    }
+
+    const effectivePath = isDir && !path.endsWith('/') ? path + '/' : path;
+    const url = this.buildUrl(effectivePath);
+
     try {
-      const response = await this.makeRequest(url, { method: 'HEAD' });
+      let response = await this.makeRequest(url, { method: 'HEAD' });
+
+      // Fallback: if we got a 404 and didn't use a trailing slash, the path
+      // might still be a directory whose listing wasn't cached. Retry with '/'.
+      if (response.status === 404 && !effectivePath.endsWith('/')) {
+        const dirUrl = this.buildUrl(effectivePath + '/');
+        rsLog('getRevision', path, { retryingWithTrailingSlash: true });
+        response = await this.makeRequest(dirUrl, { method: 'HEAD' });
+      }
+
       if (!response.ok) {
         rsLogResult('getRevision', path, `status=${response.status}`);
         return undefined;

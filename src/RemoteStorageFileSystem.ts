@@ -513,6 +513,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         const parentPath = getParentPath(path);
         const parentDir = parentPath ? `/${parentPath}/` : '/';
         await this.patchDirListingEntry(parentDir, getBasename(path), null);
+        await this.flushSaveNow();
         if (this.usePreciseMtime) {
           await this.deleteMtimeSidecar(path);
         }
@@ -531,6 +532,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       const parentPath = getParentPath(path);
       const parentDir = parentPath ? `/${parentPath}/` : '/';
       await this.patchDirListingEntry(parentDir, getBasename(path), null);
+      await this.flushSaveNow();
 
       // Delete .mtime sidecar if precise mtime is enabled
       if (this.usePreciseMtime) {
@@ -746,7 +748,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       await this.patchDirListingEntry(parentDir, getBasename(path), null);
       // Also drop the directory's own cached listing.
       this.dirListingCache.delete(normalizePath(path));
-      this.scheduleSave();
+      await this.flushSaveNow();
     } catch (error) {
       rsLogResult('rmdir', path, error, false);
       if (error instanceof FileNotFoundError || error instanceof DirectoryNotFoundError || error instanceof RemoteStorageError) {
@@ -1642,6 +1644,20 @@ export class RemoteStorageFileSystem extends FileSystem {
       this.saveTimer = null;
       void this.flushSave();
     }, 500);
+  }
+
+  /**
+   * Immediately persist the directory cache, bypassing the debounce timer.
+   * Used after deletions so that a page refresh cannot lose the cache update.
+   */
+  private async flushSaveNow(): Promise<void> {
+    if (!this.persistCache || !this.storage) return;
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+      console.log(`[RS-CACHE-SAVE] flushSaveNow backend=${this.backendName}: cancelled pending debounce timer`);
+    }
+    await this.flushSave();
   }
 
   private async flushSave(): Promise<void> {

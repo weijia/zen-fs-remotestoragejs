@@ -468,15 +468,19 @@ export class RemoteStorageFileSystem extends FileSystem {
     rsLog('unlink', path);
     path = this.validateAndNormalizePath(path);
     const normalized = normalizePath(path);
+    console.log(`[RS-TRACE] unlink(${path}) normalized=${normalized}`);
 
     // --- Pre-DELETE cache check (zero network cost) ---
     // 1a. Check existence cache
     const existCached = this.existenceCache.get(normalized);
+    console.log(`[RS-TRACE] unlink(${path}): existenceCache → ${existCached ? `exists=${existCached.exists} age=${Date.now() - existCached.ts}ms` : 'MISS'}`);
     if (existCached && !existCached.exists) {
       if (Date.now() - existCached.ts < RemoteStorageFileSystem.NEGATIVE_CACHE_TTL) {
+        console.log(`[RS-TRACE] unlink(${path}): SKIPPED (existence cache: not found, within TTL)`);
         rsLogResult('unlink', path, 'skipped (existence cache: not found)');
         return;
       }
+      console.log(`[RS-TRACE] unlink(${path}): negative cache expired, proceeding`);
     }
 
     // 1b. Check cached parent directory listing
@@ -485,18 +489,23 @@ export class RemoteStorageFileSystem extends FileSystem {
       const parentPath = getParentPath(path);
       const parentDir = parentPath ? `/${parentPath}/` : '/';
       const dirEntries = this.getCachedDirListing(parentDir);
+      console.log(`[RS-TRACE] unlink(${path}): dir listing cache for ${parentDir} → ${dirEntries ? `${dirEntries.size} entries, has(${baseName})=${dirEntries.has(baseName)}` : 'MISS'}`);
       if (dirEntries !== null && !dirEntries.has(baseName)) {
+        console.log(`[RS-TRACE] unlink(${path}): SKIPPED (not in dir listing cache)`);
         rsLogResult('unlink', path, 'skipped (not in dir listing cache)');
         return;
       }
     }
 
+    console.log(`[RS-TRACE] unlink(${path}): cache check passed, sending DELETE`);
     try {
       const url = this.buildUrl(path);
       const response = await this.makeRequest(url, { method: 'DELETE' });
+      console.log(`[RS-TRACE] unlink(${path}): DELETE response status=${response.status}`);
 
       // 404 on DELETE = file already gone = success (idempotent)
       if (response.status === 404) {
+        console.log(`[RS-TRACE] unlink(${path}): 404 — already deleted, treating as success`);
         rsLogResult('unlink', path, '404 — already deleted, treating as success');
         this.removeFromExistenceCache(path);
         const parentPath = getParentPath(path);
@@ -1000,6 +1009,7 @@ export class RemoteStorageFileSystem extends FileSystem {
 
     const callerSaysDir = path.endsWith('/');
     const baseName = getBasename(path);
+    console.log(`[RS-TRACE] stat(${path}) baseName=${baseName} callerSaysDir=${callerSaysDir}`);
 
     // ---- Stage 0: Existence check via directory listing ----
     // Before any HEAD/GET, check the cached (or freshly fetched) parent
@@ -1013,13 +1023,17 @@ export class RemoteStorageFileSystem extends FileSystem {
       const parentPath = getParentPath(path);
       const parentDir = parentPath ? `/${parentPath}/` : '/';
       let entries = this.getCachedDirListing(parentDir);
+      console.log(`[RS-TRACE] stat(${path}): dir listing cache for ${parentDir} → ${entries ? `${entries.size} entries` : 'MISS'}`);
       if (entries === null) {
         // Cache miss — fetch directory listing once, cache it for siblings
         try {
+          console.log(`[RS-TRACE] stat(${path}): fetching readdir(${parentDir})`);
           await this.readdir(parentDir);
           entries = this.getCachedDirListing(parentDir);
+          console.log(`[RS-TRACE] stat(${path}): readdir returned, cache now → ${entries ? `${entries.size} entries` : 'still MISS'}`);
         } catch {
           entries = null; // parent dir doesn't exist or can't be read
+          console.log(`[RS-TRACE] stat(${path}): readdir(${parentDir}) FAILED`);
         }
       }
       if (entries) {
@@ -1028,6 +1042,9 @@ export class RemoteStorageFileSystem extends FileSystem {
         if (cachedEntry) {
           existsViaDir = true;
           isDirViaDir = cachedEntry.isDir;
+          console.log(`[RS-TRACE] stat(${path}): FOUND in dir listing (isDir=${isDirViaDir})`);
+        } else {
+          console.log(`[RS-TRACE] stat(${path}): NOT in dir listing (entries: ${[...entries.keys()].join(', ')})`);
         }
       }
     }
@@ -1035,6 +1052,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     // If parent directory was successfully listed but file is NOT in it,
     // the file definitely doesn't exist — short-circuit.
     if (dirListingAvailable && !existsViaDir && !callerSaysDir) {
+      console.log(`[RS-TRACE] stat(${path}): → FileNotFoundError (not in dir listing)`);
       rsLogResult('stat', path, 'FileNotFoundError (not in dir listing)', false);
       throw new FileNotFoundError(path);
     }

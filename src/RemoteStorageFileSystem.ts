@@ -1575,11 +1575,17 @@ export class RemoteStorageFileSystem extends FileSystem {
     await this.ensureCacheLoaded();
     const key = normalizePath(parentDir);
     const cached = this.dirListingCache.get(key);
-    if (!cached) return; // nothing cached for this dir; will be fetched on demand
+    if (!cached) {
+      console.log(`[RS-PATCH] patchDirListingEntry(${parentDir}, ${name}, ${entry ? 'add' : 'delete'}) backend=${this.backendName}: dir NOT in cache, nothing to patch`);
+      return; // nothing cached for this dir; will be fetched on demand
+    }
     if (entry === null) {
+      const had = cached.entries.has(name);
       cached.entries.delete(name);
+      console.log(`[RS-PATCH] patchDirListingEntry(${parentDir}, ${name}, DELETE) backend=${this.backendName}: hadEntry=${had}, remaining entries=[${[...cached.entries.keys()].join(',')}], scheduling save`);
     } else {
       cached.entries.set(name, entry);
+      console.log(`[RS-PATCH] patchDirListingEntry(${parentDir}, ${name}, ADD) backend=${this.backendName}: entries now=[${[...cached.entries.keys()].join(',')}], scheduling save`);
     }
     cached.ts = Date.now();
     this.scheduleSave();
@@ -1627,7 +1633,11 @@ export class RemoteStorageFileSystem extends FileSystem {
    */
   private scheduleSave(): void {
     if (!this.persistCache || !this.storage) return;
-    if (this.saveTimer) return; // already scheduled
+    if (this.saveTimer) {
+      console.log(`[RS-CACHE-SAVE] scheduleSave backend=${this.backendName}: timer already pending (debounce), skipping`);
+      return; // already scheduled
+    }
+    console.log(`[RS-CACHE-SAVE] scheduleSave backend=${this.backendName}: scheduling flushSave in 500ms`);
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
       void this.flushSave();
@@ -1647,8 +1657,11 @@ export class RemoteStorageFileSystem extends FileSystem {
       }
       blob[this.cacheNamespace] = out;
       await this.storage!.save(blob);
+      const dirSummary = Object.entries(out).map(([k, v]) => `${k}:[${Object.keys(v.entries).join(',')}]`).join(' ');
+      console.log(`[RS-CACHE-SAVE] flushSave backend=${this.backendName}: persisted ${this.dirListingCache.size} dirs — ${dirSummary}`);
       rsLogResult('cache', 'save', `persisted ${this.dirListingCache.size} dirs`);
     } catch (err) {
+      console.log(`[RS-CACHE-SAVE] flushSave backend=${this.backendName}: FAILED: ${err}`);
       rsLogResult('cache', 'save', err, false);
     }
   }

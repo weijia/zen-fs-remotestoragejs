@@ -468,12 +468,15 @@ export class RemoteStorageFileSystem extends FileSystem {
     rsLog('unlink', path);
     path = this.validateAndNormalizePath(path);
     const normalized = normalizePath(path);
-    console.log(`[RS-TRACE] unlink(${path}) normalized=${normalized}`);
 
     // --- Pre-DELETE cache check (zero network cost) ---
     // 1a. Check existence cache
     const existCached = this.existenceCache.get(normalized);
-    console.log(`[RS-TRACE] unlink(${path}): existenceCache → ${existCached ? `exists=${existCached.exists} age=${Date.now() - existCached.ts}ms` : 'MISS'}`);
+    console.log(`[RS-TRACE] unlink(${path}) normalized=${normalized} existenceCache → ${existCached ? `exists=${existCached.exists} age=${Date.now() - existCached.ts}ms` : 'MISS'}`);
+    if (!existCached) {
+      console.log(`[RS-TRACE] unlink(${path}): existenceCache MISS — caller stack:`);
+      console.trace();
+    }
     if (existCached && !existCached.exists) {
       if (Date.now() - existCached.ts < RemoteStorageFileSystem.NEGATIVE_CACHE_TTL) {
         console.log(`[RS-TRACE] unlink(${path}): SKIPPED (existence cache: not found, within TTL)`);

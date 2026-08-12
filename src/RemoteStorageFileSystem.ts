@@ -79,8 +79,8 @@ export class RemoteStorageFileSystem extends FileSystem {
    * - `undefined` = unknown, needs network check
    */
   private existenceCache = new Map<string, { exists: boolean; ts: number }>();
-  private static readonly NEGATIVE_CACHE_TTL = 15_000; // 15s for negative results
-  private static readonly POSITIVE_CACHE_TTL = 10_000; // 10s for positive results
+  private static readonly NEGATIVE_CACHE_TTL = 60_000; // 1 min for negative results
+  private static readonly POSITIVE_CACHE_TTL = 300_000; // 5 min — aligned with DIR_LISTING_TTL
 
   /**
    * Directory listing cache — caches readdir() results (with per-entry
@@ -1008,18 +1008,17 @@ export class RemoteStorageFileSystem extends FileSystem {
     // If parent directory was successfully listed but file is NOT in it,
     // we need to decide: is the listing fresh enough to trust?
     //
-    // dirListingCache has a 5-minute TTL, but a file could have been created
-    // externally (by another client or sync cycle) since the listing was
-    // cached. To avoid false "not found" results, we only short-circuit when
-    // the listing is FRESH (within POSITIVE_CACHE_TTL = 10s). For stale
-    // listings, we fall through to a HEAD probe to verify with the server.
+    // Trust the listing up to DIR_LISTING_TTL (5 min). If the listing is
+    // still within its TTL, a "not in listing" result means the file
+    // genuinely doesn't exist — no HEAD probe needed. Only when the listing
+    // has fully expired do we fall through to HEAD verification.
     if (dirListingAvailable && !existsViaDir && !callerSaysDir) {
       const parentPath = getParentPath(path);
       const parentDir = parentPath ? `/${parentPath}/` : '/';
       const listingAge = this.getDirListingAge(parentDir);
-      if (listingAge !== null && listingAge < RemoteStorageFileSystem.POSITIVE_CACHE_TTL) {
-        loggers.stat.log(`[RS-STAT] stat(${path}): → FileNotFoundError (not in FRESH dir listing, age=${listingAge}ms < ${RemoteStorageFileSystem.POSITIVE_CACHE_TTL}ms)`);
-        this.logger.logResult('stat', path, 'FileNotFoundError (not in fresh dir listing)', false);
+      if (listingAge !== null && listingAge < RemoteStorageFileSystem.DIR_LISTING_TTL) {
+        loggers.stat.log(`[RS-STAT] stat(${path}): → FileNotFoundError (not in dir listing, age=${listingAge}ms < ${RemoteStorageFileSystem.DIR_LISTING_TTL}ms)`);
+        this.logger.logResult('stat', path, 'FileNotFoundError (not in dir listing)', false);
         throw new FileNotFoundError(path);
       }
       // Listing is stale — file might have been created externally.
@@ -1030,11 +1029,14 @@ export class RemoteStorageFileSystem extends FileSystem {
     // If the caller explicitly passes a trailing slash, they already know
     // it's a directory — skip the file probe entirely.
     // Try HEAD when:
-    //   (a) dir listing confirmed file exists but cached entry lacks metadata
-    //   (b) dir listing wasn't available (parent unreadable) — HEAD as fallback
-    //   (c) dir listing was available but STALE and file not in it — verify
+    //   (a) dir listing wasn't available (parent unreadable) — HEAD as fallback
+    //   (b) dir listing was available but STALE and file not in it — verify
     //       with server before declaring not-found (prevents cache inconsistency)
-    const needMetadata = !cachedEntry || cachedEntry.size === undefined;
+    //
+    // NOTE: When the file IS in the dir listing but the entry lacks `size`,
+    // we do NOT send HEAD just for metadata. Stage 2 returns stat with
+    // `size: 0` — acceptable for sync which keys on mtime, not size.
+    const needMetadata = !cachedEntry;
     const shouldTryHead = !callerSaysDir && this.headSupported !== false
       && !isDirViaDir && needMetadata;
     loggers.stat.log(`[RS-STAT] stat(${path}): shouldTryHead=${shouldTryHead} (callerSaysDir=${callerSaysDir} headSupported=${this.headSupported} isDirViaDir=${isDirViaDir} needMetadata=${needMetadata})`);
@@ -1266,10 +1268,17 @@ export class RemoteStorageFileSystem extends FileSystem {
             baseName,
             found: !!entry,
             isDir: entry?.isDir,
+            etag: entry?.etag,
           });
           if (entry?.isDir) {
             isDir = true;
             dirCheckSource = 'parent-listing';
+          }
+          // If the directory listing has an ETag for this file, return it
+          // directly — no HEAD request needed.
+          if (entry?.etag) {
+            this.logger.logResult('getRevision', path, `etag=${entry.etag} (from dir listing)`);
+            return entry.etag;
           }
         } else {
           this.logger.log('getRevision', path, { dirCheck: 'parent-dir-not-found' });

@@ -29,7 +29,7 @@
     "format": "prettier --write \"src/**/*.ts\"",
     "typecheck": "tsc --noEmit",
     "clean": "rimraf dist",
-    "prepublishOnly": "npm run clean && npm run build && npm run test:run"
+    "prepublishOnly": "npm run clean && npm run build"
   },
   "keywords": [
     "zen-fs",

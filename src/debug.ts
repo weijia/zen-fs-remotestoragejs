@@ -19,6 +19,34 @@ function truncate(data: unknown, max = 200): string {
   return s;
 }
 
+/**
+ * Create a logger bound to a specific backend name.
+ * All log output will be prefixed with `[RS:backendName]` so that
+ * multiple RemoteStorage instances (primary, replica, etc.) are
+ * distinguishable in the console.
+ */
+export function createLogger(backendName: string) {
+  const log = (method: string, path: string, detail?: Record<string, unknown>) => {
+    if (!isDebug()) return;
+    const parts = [`[RS:${backendName}] ${method} path=${path}`];
+    if (detail) {
+      for (const [k, v] of Object.entries(detail)) {
+        parts.push(`${k}=${truncate(v)}`);
+      }
+    }
+    console.log(parts.join(' '));
+  };
+
+  const logResult = (method: string, path: string, result: unknown, ok = true) => {
+    if (!isDebug()) return;
+    const status = ok ? 'OK' : 'ERR';
+    console.log(`[RS:${backendName}] ${method} path=${path} → ${status} ${truncate(result)}`);
+  };
+
+  return { log, logResult };
+}
+
+// Backward-compatible standalone functions (no backend name in prefix)
 export function rsLog(method: string, path: string, detail?: Record<string, unknown>) {
   if (!isDebug()) return;
   const parts = [`[RS] ${method} path=${path}`];

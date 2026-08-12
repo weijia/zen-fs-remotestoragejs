@@ -26,7 +26,7 @@ import {
   mtimePathFor,
   isMtimeSidecar,
 } from './utils.js';
-import { rsLog, rsLogResult } from './debug.js';
+import { createLogger } from './debug.js';
 import { createCacheStorage, CacheStorage } from './persistence.js';
 import { IdbKVStore } from 'zen-fs-cache';
 
@@ -70,6 +70,7 @@ export class RemoteStorageFileSystem extends FileSystem {
   private headers: Headers;
   private timeout: number;
   readonly backendName: string;
+  private readonly logger: ReturnType<typeof createLogger>;
 
   /**
    * Existence cache to avoid repeated HEAD/GET requests for the same path.
@@ -153,7 +154,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     
     // Set backend name for zen-fs-sync logging
     this.backendName = `RemoteStorage@${config.href.replace(/^https?:\/\//, '')}`;
-
+    this.logger = createLogger(this.backendName);
     // Normalize base URL
     this.baseUrl = config.href.endsWith('/') ? config.href.slice(0, -1) : config.href;
     
@@ -206,7 +207,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       ? basePath + suffix.slice(1)
       : basePath + suffix;
     const url = this.baseUrl + fullPath;
-    rsLog('buildUrl', path, { isDir, url });
+    this.logger.log('buildUrl', path, { isDir, url });
     return url;
   }
 
@@ -215,7 +216,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    */
   private async makeRequest(url: string, options: RequestInit = {}): Promise<Response> {
     const method = options.method || 'GET';
-    rsLog('makeRequest', url, { method, attempt: 'start' });
+    this.logger.log('makeRequest', url, { method, attempt: 'start' });
     const maxRetries = 3;
     let lastError: any = null;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -234,12 +235,12 @@ export class RemoteStorageFileSystem extends FileSystem {
           signal: controller.signal,
         });
         clearTimeout(timeoutId);
-        rsLogResult('makeRequest', url, `${method} status=${response.status}`);
+        this.logger.logResult('makeRequest', url, `${method} status=${response.status}`);
         return response;
       } catch (error) {
         clearTimeout(timeoutId);
         lastError = error;
-        rsLogResult('makeRequest', url, `${method} attempt=${attempt + 1} error=${error instanceof Error ? error.message : String(error)}`, false);
+        this.logger.logResult('makeRequest', url, `${method} attempt=${attempt + 1} error=${error instanceof Error ? error.message : String(error)}`, false);
         if (error instanceof Error && (error.name === 'AbortError' || error.name === 'FetchError' || error.message?.includes('network'))) {
           if (attempt < maxRetries - 1) {
             await new Promise(res => setTimeout(res, 200 * (attempt + 1)));
@@ -298,7 +299,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Check if file/directory exists
    */
   async exists(path: string): Promise<boolean> {
-    rsLog('exists', path);
+    this.logger.log('exists', path);
     const normalized = normalizePath(path);
 
     // Full cache state dump for debugging
@@ -312,7 +313,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         // Positive result: respect TTL
         if (Date.now() - cached.ts < RemoteStorageFileSystem.POSITIVE_CACHE_TTL) {
           console.log(`[RS-EXISTS]   → true (existenceCache HIT: positive, age=${Date.now() - cached.ts}ms < ${RemoteStorageFileSystem.POSITIVE_CACHE_TTL}ms)`);
-          rsLogResult('exists', path, true, true);
+          this.logger.logResult('exists', path, true, true);
           return true;
         }
         console.log(`[RS-EXISTS]   existenceCache positive EXPIRED (age=${Date.now() - cached.ts}ms), falling through to stat()`);
@@ -321,7 +322,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         // Negative result: respect TTL
         if (Date.now() - cached.ts < RemoteStorageFileSystem.NEGATIVE_CACHE_TTL) {
           console.log(`[RS-EXISTS]   → false (existenceCache HIT: negative, age=${Date.now() - cached.ts}ms < ${RemoteStorageFileSystem.NEGATIVE_CACHE_TTL}ms)`);
-          rsLogResult('exists', path, false, true);
+          this.logger.logResult('exists', path, false, true);
           return false;
         }
         console.log(`[RS-EXISTS]   existenceCache negative EXPIRED (age=${Date.now() - cached.ts}ms), falling through to stat()`);
@@ -335,17 +336,17 @@ export class RemoteStorageFileSystem extends FileSystem {
       await this.stat(path);
       this.existenceCache.set(normalized, { exists: true, ts: Date.now() });
       console.log(`[RS-EXISTS]   → true (stat() succeeded, existenceCache updated)`);
-      rsLogResult('exists', path, true);
+      this.logger.logResult('exists', path, true);
       return true;
     } catch (error) {
       if (error instanceof FileNotFoundError) {
         this.existenceCache.set(normalized, { exists: false, ts: Date.now() });
         console.log(`[RS-EXISTS]   → false (stat() threw FileNotFoundError, existenceCache updated)`);
-        rsLogResult('exists', path, false);
+        this.logger.logResult('exists', path, false);
         return false;
       }
       console.log(`[RS-EXISTS]   → ERROR: ${error instanceof Error ? error.message : String(error)}`);
-      rsLogResult('exists', path, error, false);
+      this.logger.logResult('exists', path, error, false);
       throw error;
     }
   }
@@ -354,7 +355,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Read file contents
    */
   async readFile(path: string): Promise<Uint8Array> {
-    rsLog('readFile', path);
+    this.logger.log('readFile', path);
     path = this.validateAndNormalizePath(path);
     const url = this.buildUrl(path);
     try {
@@ -364,10 +365,10 @@ export class RemoteStorageFileSystem extends FileSystem {
       }
       const arrayBuffer = await response.arrayBuffer();
       const data = new Uint8Array(arrayBuffer);
-      rsLogResult('readFile', path, `size=${data.byteLength}`);
+      this.logger.logResult('readFile', path, `size=${data.byteLength}`);
       return data;
     } catch (error) {
-      rsLogResult('readFile', path, error, false);
+      this.logger.logResult('readFile', path, error, false);
       if (error instanceof FileNotFoundError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -382,14 +383,14 @@ export class RemoteStorageFileSystem extends FileSystem {
    */
   async writeFile(path: string, data: string | Uint8Array | ArrayBuffer, options?: { flag?: string; mtime?: number }): Promise<void> {
     const size = typeof data === 'string' ? data.length : (data as Uint8Array).byteLength;
-    rsLog('writeFile', path, { flag: options?.flag, size });
+    this.logger.log('writeFile', path, { flag: options?.flag, size });
     path = this.validateAndNormalizePath(path);
     const flag = options?.flag;
     // Check if file exists for exclusive flags
     if (flag === 'x' || flag === 'wx') {
       const exists = await this.exists(path);
       if (exists) {
-        rsLogResult('writeFile', path, 'FileExistsError', false);
+        this.logger.logResult('writeFile', path, 'FileExistsError', false);
         throw new FileExistsError(path);
       }
     }
@@ -420,7 +421,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       if (!response.ok) {
         this.handleHttpError(response, path, 'writeFile');
       }
-      rsLogResult('writeFile', path, `status=${response.status}`);
+      this.logger.logResult('writeFile', path, `status=${response.status}`);
       this.invalidateExistenceCache(path);
 
       // Write .mtime sidecar if precise mtime is enabled
@@ -445,7 +446,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       // Update snapshot with new ETag from PUT response
       this.updateSnapshotForPath(path, newEtag ?? null);
     } catch (error) {
-      rsLogResult('writeFile', path, error, false);
+      this.logger.logResult('writeFile', path, error, false);
       if (error instanceof FileExistsError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -462,7 +463,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * enabled, a .mtime sidecar is written preserving the exact mtime.
    */
   async writeFileWithMtime(path: string, data: string | Uint8Array | ArrayBuffer, mtime: number): Promise<void> {
-    rsLog('writeFileWithMtime', path, { mtime });
+    this.logger.log('writeFileWithMtime', path, { mtime });
     await this.writeFile(path, data, { mtime });
   }
 
@@ -478,7 +479,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    *    already gone, which is the desired end state).
    */
   async unlink(path: string): Promise<void> {
-    rsLog('unlink', path);
+    this.logger.log('unlink', path);
     path = this.validateAndNormalizePath(path);
     const normalized = normalizePath(path);
 
@@ -493,7 +494,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     if (existCached && !existCached.exists) {
       if (Date.now() - existCached.ts < RemoteStorageFileSystem.NEGATIVE_CACHE_TTL) {
         console.log(`[RS-UNLINK] unlink(${path}): SKIPPED (existence cache: not found, within TTL)`);
-        rsLogResult('unlink', path, 'skipped (existence cache: not found)');
+        this.logger.logResult('unlink', path, 'skipped (existence cache: not found)');
         return;
       }
       console.log(`[RS-UNLINK] unlink(${path}): negative cache expired, proceeding to DELETE`);
@@ -508,7 +509,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       // 404 on DELETE = file already gone = success (idempotent)
       if (response.status === 404) {
         console.log(`[RS-UNLINK] unlink(${path}): 404 — already deleted, treating as success`);
-        rsLogResult('unlink', path, '404 — already deleted, treating as success');
+        this.logger.logResult('unlink', path, '404 — already deleted, treating as success');
         this.removeFromExistenceCache(path);
         const parentPath = getParentPath(path);
         const parentDir = parentPath ? `/${parentPath}/` : '/';
@@ -524,7 +525,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       if (!response.ok) {
         this.handleHttpError(response, path, 'unlink');
       }
-      rsLogResult('unlink', path, `status=${response.status}`);
+      this.logger.logResult('unlink', path, `status=${response.status}`);
       this.removeFromExistenceCache(path);
 
       // Precisely remove this file's entry from the parent directory's cached
@@ -542,7 +543,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       // Update snapshot — remove the deleted path
       this.updateSnapshotForPath(path, null);
     } catch (error) {
-      rsLogResult('unlink', path, error, false);
+      this.logger.logResult('unlink', path, error, false);
       if (error instanceof FileNotFoundError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -556,12 +557,12 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Read directory contents
    */
   async readdir(path: string): Promise<string[]> {
-    rsLog('readdir', path);
+    this.logger.log('readdir', path);
     path = this.validateAndNormalizePath(path, true);
     try {
       const entries = await this.ensureDirListing(path);
       if (!entries) {
-        rsLogResult('readdir', path, 'DirectoryNotFoundError', false);
+        this.logger.logResult('readdir', path, 'DirectoryNotFoundError', false);
         throw new DirectoryNotFoundError(path);
       }
 
@@ -573,11 +574,11 @@ export class RemoteStorageFileSystem extends FileSystem {
       }
 
       console.log(`[RS-READDIR] readdir(${path}) backend=${this.backendName}: ${entries.size} entries, returning ${names.length} visible names`);
-      rsLogResult('readdir', path, `count=${names.length} [${names.join(', ')}]`);
+      this.logger.logResult('readdir', path, `count=${names.length} [${names.join(', ')}]`);
       this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
       return names;
     } catch (error) {
-      rsLogResult('readdir', path, error, false);
+      this.logger.logResult('readdir', path, error, false);
       if (error instanceof DirectoryNotFoundError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -615,7 +616,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Create directory
    */
   async mkdir(path: string, options?: CreationOptions): Promise<InodeLike> {
-    rsLog('mkdir', path);
+    this.logger.log('mkdir', path);
     path = this.validateAndNormalizePath(path, true);
     try {
       // 创建占位文件，确保目录可见
@@ -637,7 +638,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         birthtimeMs: Date.now(),
         nlink: 1,
       };
-      rsLogResult('mkdir', path, `mode=${result.mode.toString(8)}`);
+      this.logger.logResult('mkdir', path, `mode=${result.mode.toString(8)}`);
       this.invalidateExistenceCache(path);
       // Precisely add this directory's entry to the parent's cached listing.
       const parentPath = getParentPath(path);
@@ -649,7 +650,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       });
       return result;
     } catch (error) {
-      rsLogResult('mkdir', path, error, false);
+      this.logger.logResult('mkdir', path, error, false);
       if (error instanceof FileExistsError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -663,19 +664,19 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Remove directory
    */
   async rmdir(path: string): Promise<void> {
-    rsLog('rmdir', path);
+    this.logger.log('rmdir', path);
     path = this.validateAndNormalizePath(path, true);
     try {
       // Check if directory exists
       const stats = await this.stat(path);
       if (!this.isDirectoryMode(stats.mode)) {
-        rsLogResult('rmdir', path, 'Not a directory', false);
+        this.logger.logResult('rmdir', path, 'Not a directory', false);
         throw new RemoteStorageError(`Not a directory: ${path}`);
       }
       // Check directory entries
       const entries = await this.readdir(path);
       if (entries.length > 1 || (entries.length === 1 && entries[0] !== '.keep')) {
-        rsLogResult('rmdir', path, `Directory not empty: [${entries.join(', ')}]`, false);
+        this.logger.logResult('rmdir', path, `Directory not empty: [${entries.join(', ')}]`, false);
         throw new RemoteStorageError(`Directory not empty (except .keep): ${path}`);
       }
       // 删除 .keep 占位文件（如果存在）
@@ -683,7 +684,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         const keepFilePath = joinPath(path, '.keep');
         await this.unlink(keepFilePath);
       }
-      rsLogResult('rmdir', path, 'OK');
+      this.logger.logResult('rmdir', path, 'OK');
       this.removeFromExistenceCache(path);
       // Precisely remove this directory's entry from the parent's cached listing.
       const parentPath = getParentPath(path);
@@ -693,7 +694,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       this.dirListingCache.delete(normalizePath(path));
       await this.flushSaveNow();
     } catch (error) {
-      rsLogResult('rmdir', path, error, false);
+      this.logger.logResult('rmdir', path, error, false);
       if (error instanceof FileNotFoundError || error instanceof DirectoryNotFoundError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -728,9 +729,9 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Rename/move file or directory
    */
   async rename(oldPath: string, newPath: string): Promise<void> {
-    rsLog('rename', oldPath, { to: newPath });
+    this.logger.log('rename', oldPath, { to: newPath });
     if (!isValidPath(oldPath) || !isValidPath(newPath)) {
-      rsLogResult('rename', oldPath, 'Invalid path format', false);
+      this.logger.logResult('rename', oldPath, 'Invalid path format', false);
       throw new RemoteStorageError('Invalid path format');
     }
 
@@ -740,7 +741,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       // 检查目标是否已存在
       const destExists = await this.exists(newPath);
       if (destExists) {
-        rsLogResult('rename', oldPath, `FileExistsError: ${newPath}`, false);
+        this.logger.logResult('rename', oldPath, `FileExistsError: ${newPath}`, false);
         throw new FileExistsError(newPath);
       }
 
@@ -754,9 +755,9 @@ export class RemoteStorageFileSystem extends FileSystem {
         await this.copyDirectoryRecursive(oldPath, newPath);
         await this.rmdirRecursive(oldPath);
       }
-      rsLogResult('rename', oldPath, `→ ${newPath}`);
+      this.logger.logResult('rename', oldPath, `→ ${newPath}`);
     } catch (error) {
-      rsLogResult('rename', oldPath, error, false);
+      this.logger.logResult('rename', oldPath, error, false);
       if (error instanceof FileNotFoundError || error instanceof FileExistsError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -824,7 +825,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Sync filesystem (no-op for RemoteStorage as it's always synced)
    */
   async sync(): Promise<void> {
-    rsLog('sync', '(root)');
+    this.logger.log('sync', '(root)');
     // RemoteStorage is always synced via HTTP
   }
 
@@ -832,7 +833,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Disconnect and cleanup
    */
   async disconnect(): Promise<void> {
-    rsLog('disconnect', '(root)');
+    this.logger.log('disconnect', '(root)');
     // Nothing to disconnect for HTTP-based implementation
   }
 
@@ -909,24 +910,24 @@ export class RemoteStorageFileSystem extends FileSystem {
    * does not support them). If precise mtime is disabled, this is a no-op.
    */
   async touch(path: string, metadata: Partial<InodeLike>): Promise<void> {
-    rsLog('touch', path, metadata);
+    this.logger.log('touch', path, metadata);
 
     if (this.usePreciseMtime && metadata.mtimeMs !== undefined) {
       path = this.validateAndNormalizePath(path);
       await this.writeMtimeSidecar(path, metadata.mtimeMs);
-      rsLogResult('touch', path, `mtimeMs=${metadata.mtimeMs}`);
+      this.logger.logResult('touch', path, `mtimeMs=${metadata.mtimeMs}`);
       return;
     }
 
     // Without precise mtime, touch is a no-op (RS doesn't support it)
-    rsLogResult('touch', path, 'no-op (preciseMtime disabled or no mtimeMs)');
+    this.logger.logResult('touch', path, 'no-op (preciseMtime disabled or no mtimeMs)');
   }
 
   /**
    * Create the file at path with the given options
    */
   async createFile(path: string, options: CreationOptions): Promise<InodeLike> {
-    rsLog('createFile', path);
+    this.logger.log('createFile', path);
     await this.writeFile(path, new Uint8Array(0));
     const result = {
       ino: 0,
@@ -940,7 +941,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       birthtimeMs: Date.now(),
       nlink: 1,
     };
-    rsLogResult('createFile', path, `mode=${result.mode.toString(8)}`);
+    this.logger.logResult('createFile', path, `mode=${result.mode.toString(8)}`);
     this.invalidateExistenceCache(path);
     return result;
   }
@@ -949,10 +950,10 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Get file/directory stat information
    */
   async stat(path: string): Promise<InodeLike> {
-    rsLog('stat', path);
+    this.logger.log('stat', path);
     // NOTE: main stat ENTER log is after isValidPath check below
     if (!isValidPath(path)) {
-      rsLogResult('stat', path, 'Invalid path format', false);
+      this.logger.logResult('stat', path, 'Invalid path format', false);
       throw new RemoteStorageError('Invalid path format');
     }
 
@@ -1008,7 +1009,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       const listingAge = this.getDirListingAge(parentDir);
       if (listingAge !== null && listingAge < RemoteStorageFileSystem.POSITIVE_CACHE_TTL) {
         console.log(`[RS-STAT] stat(${path}): → FileNotFoundError (not in FRESH dir listing, age=${listingAge}ms < ${RemoteStorageFileSystem.POSITIVE_CACHE_TTL}ms)`);
-        rsLogResult('stat', path, 'FileNotFoundError (not in fresh dir listing)', false);
+        this.logger.logResult('stat', path, 'FileNotFoundError (not in fresh dir listing)', false);
         throw new FileNotFoundError(path);
       }
       // Listing is stale — file might have been created externally.
@@ -1056,7 +1057,7 @@ export class RemoteStorageFileSystem extends FileSystem {
               ino: 0, mode: 0o100644, uid: 0, gid: 0,
               size, mtimeMs: mtime, ctimeMs: mtime, atimeMs: mtime, birthtimeMs: mtime, nlink: 1,
             };
-            rsLogResult('stat', path, `FILE mode=${result.mode.toString(8)} size=${size}`);
+            this.logger.logResult('stat', path, `FILE mode=${result.mode.toString(8)} size=${size}`);
             console.log(`[RS-STAT] stat(${path}): returning via HEAD OK (size=${size}), setting existenceCache=true`);
             this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
             return result;
@@ -1064,7 +1065,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         }
         if (response.status === 405) {
           this.headSupported = false;
-          rsLog('stat', path, { headStatus: 405, cachedAsUnsupported: true });
+          this.logger.log('stat', path, { headStatus: 405, cachedAsUnsupported: true });
         } else if (response.status === 401 || response.status === 403) {
           this.handleHttpError(response, path, 'stat');
         } else if (response.status === 404) {
@@ -1073,13 +1074,13 @@ export class RemoteStorageFileSystem extends FileSystem {
           console.log(`[RS-STAT] stat(${path}): HEAD 404 — file confirmed not found, setting existenceCache=false`);
           this.existenceCache.set(normalizePath(path), { exists: false, ts: Date.now() });
         }
-        rsLog('stat', path, { headStatus: response.status, fallingThrough: 'readdir stat' });
+        this.logger.log('stat', path, { headStatus: response.status, fallingThrough: 'readdir stat' });
         console.log(`[RS-STAT] stat(${path}): HEAD status=${response.status}, falling through to stage 2`);
       } catch (error) {
         if (error instanceof AuthenticationError || error instanceof PermissionDeniedError) {
           throw error;
         }
-        rsLog('stat', path, { headError: error instanceof Error ? error.message : String(error), fallingThrough: 'readdir stat' });
+        this.logger.log('stat', path, { headError: error instanceof Error ? error.message : String(error), fallingThrough: 'readdir stat' });
       }
     }
 
@@ -1087,7 +1088,7 @@ export class RemoteStorageFileSystem extends FileSystem {
 
     // File confirmed as directory via listing
     if (existsViaDir && isDirViaDir) {
-      rsLogResult('stat', path, `DIR mode=40755 (via dir listing)`);
+      this.logger.logResult('stat', path, `DIR mode=40755 (via dir listing)`);
       console.log(`[RS-STAT] stat(${path}): returning via dir listing (isDir), setting existenceCache=true`);
       this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
       return { ino: 0, mode: 0o040755, uid: 0, gid: 0, size: 0,
@@ -1111,7 +1112,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         }
       }
 
-      rsLogResult('stat', path, `FILE mode=100644 (via dir listing, size=${size})`);
+      this.logger.logResult('stat', path, `FILE mode=100644 (via dir listing, size=${size})`);
       console.log(`[RS-STAT] stat(${path}): returning via dir listing (file, size=${size}), setting existenceCache=true`);
       this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
       return { ino: 0, mode: 0o100644, uid: 0, gid: 0, size,
@@ -1132,7 +1133,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       if (response.ok) {
         const contentType = response.headers.get('content-type') || '';
         if (contentType.includes('application/ld+json') || contentType.includes('text/html')) {
-          rsLogResult('stat', path, `DIR mode=40755 (via dir probe)`);
+          this.logger.logResult('stat', path, `DIR mode=40755 (via dir probe)`);
           console.log(`[RS-STAT] stat(${path}): returning via dir probe, setting existenceCache=true`);
           this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
           return { ino: 0, mode: 0o040755, uid: 0, gid: 0, size: 0,
@@ -1148,7 +1149,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       }
     }
 
-    rsLogResult('stat', path, 'FileNotFoundError', false);
+    this.logger.logResult('stat', path, 'FileNotFoundError', false);
     console.log(`[RS-STAT] stat(${path}): → FileNotFoundError (all paths exhausted)`);
     throw new FileNotFoundError(path);
   }
@@ -1165,7 +1166,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     path: string,
     opts?: { ifNoneMatch?: string; ifModifiedSince?: string },
   ): Promise<{ status: number; data?: Uint8Array; etag?: string; lastModified?: string; preciseMtime?: number; contentType?: string }> {
-    rsLog('readFileMeta', path, opts);
+    this.logger.log('readFileMeta', path, opts);
     path = this.validateAndNormalizePath(path);
     const url = this.buildUrl(path);
     const headers: Record<string, string> = {};
@@ -1175,7 +1176,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     try {
       const response = await this.makeRequest(url, { method: 'GET', headers });
       if (response.status === 304) {
-        rsLogResult('readFileMeta', path, '304 Not Modified');
+        this.logger.logResult('readFileMeta', path, '304 Not Modified');
         return {
           status: 304,
           etag: response.headers.get('ETag') ?? opts?.ifNoneMatch,
@@ -1186,7 +1187,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         this.handleHttpError(response, path, 'readFileMeta');
       }
       const data = new Uint8Array(await response.arrayBuffer());
-      rsLogResult('readFileMeta', path, `200 size=${data.byteLength}`);
+      this.logger.logResult('readFileMeta', path, `200 size=${data.byteLength}`);
 
       // Read precise mtime from sidecar if enabled
       let preciseMtime: number | undefined;
@@ -1203,7 +1204,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         contentType: response.headers.get('Content-Type') ?? undefined,
       };
     } catch (error) {
-      rsLogResult('readFileMeta', path, error, false);
+      this.logger.logResult('readFileMeta', path, error, false);
       if (error instanceof FileNotFoundError || error instanceof RemoteStorageError) {
         throw error;
       }
@@ -1228,7 +1229,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    *      directory path without a slash).
    */
   async getRevision(path: string): Promise<string | number | undefined> {
-    rsLog('getRevision', path);
+    this.logger.log('getRevision', path);
     path = this.validateAndNormalizePath(path);
 
     // Determine whether the path is a directory using the cached parent
@@ -1242,7 +1243,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       const parentDir = parentPath ? `/${parentPath}/` : '/';
       try {
         const entries = await this.ensureDirListing(parentDir);
-        rsLog('getRevision', path, {
+        this.logger.log('getRevision', path, {
           dirCheck: 'ensureDirListing',
           parentDir,
           hasCache: entries !== null,
@@ -1250,7 +1251,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         });
         if (entries) {
           const entry = entries.get(baseName);
-          rsLog('getRevision', path, {
+          this.logger.log('getRevision', path, {
             dirCheck: 'parent-listing-hit',
             baseName,
             found: !!entry,
@@ -1261,41 +1262,41 @@ export class RemoteStorageFileSystem extends FileSystem {
             dirCheckSource = 'parent-listing';
           }
         } else {
-          rsLog('getRevision', path, { dirCheck: 'parent-dir-not-found' });
+          this.logger.log('getRevision', path, { dirCheck: 'parent-dir-not-found' });
         }
       } catch (err) {
-        rsLog('getRevision', path, { dirCheck: 'ensureDirListing-error', error: String(err) });
+        this.logger.log('getRevision', path, { dirCheck: 'ensureDirListing-error', error: String(err) });
       }
     }
 
     const effectivePath = isDir && !path.endsWith('/') ? path + '/' : path;
     const url = this.buildUrl(effectivePath);
-    rsLog('getRevision', path, {
+    this.logger.log('getRevision', path, {
       isDir, dirCheckSource, effectivePath, url,
     });
 
     try {
       let response = await this.makeRequest(url, { method: 'HEAD' });
-      rsLog('getRevision', path, { firstAttemptStatus: response.status });
+      this.logger.log('getRevision', path, { firstAttemptStatus: response.status });
 
       // Fallback: if we got a 404 and didn't use a trailing slash, the path
       // might still be a directory whose listing wasn't cached. Retry with '/'.
       if (response.status === 404 && !effectivePath.endsWith('/')) {
         const dirUrl = this.buildUrl(effectivePath + '/');
-        rsLog('getRevision', path, { retryingWithTrailingSlash: true, dirUrl });
+        this.logger.log('getRevision', path, { retryingWithTrailingSlash: true, dirUrl });
         response = await this.makeRequest(dirUrl, { method: 'HEAD' });
-        rsLog('getRevision', path, { retryStatus: response.status });
+        this.logger.log('getRevision', path, { retryStatus: response.status });
       }
 
       if (!response.ok) {
-        rsLogResult('getRevision', path, `status=${response.status}`);
+        this.logger.logResult('getRevision', path, `status=${response.status}`);
         return undefined;
       }
       const rev = response.headers.get('ETag') ?? response.headers.get('Last-Modified') ?? undefined;
-      rsLogResult('getRevision', path, rev);
+      this.logger.logResult('getRevision', path, rev);
       return rev;
     } catch (err) {
-      rsLogResult('getRevision', path, err, false);
+      this.logger.logResult('getRevision', path, err, false);
       return undefined;
     }
   }
@@ -1304,7 +1305,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Hard link operation (not supported)
    */
   async link(target: string, link: string): Promise<void> {
-    rsLog('link', target, { link });
+    this.logger.log('link', target, { link });
     throw new Error('Link operation not supported by RemoteStorage');
   }
 
@@ -1312,18 +1313,18 @@ export class RemoteStorageFileSystem extends FileSystem {
    * Read into a buffer
    */
   async read(path: string, buffer: Uint8Array, start: number, end: number): Promise<void> {
-    rsLog('read', path, { start, end, bufLen: buffer.length });
+    this.logger.log('read', path, { start, end, bufLen: buffer.length });
     const data = await this.readFile(path);
     const slice = data.slice(start, end);
     buffer.set(slice, 0);
-    rsLogResult('read', path, `copied=${slice.length}`);
+    this.logger.logResult('read', path, `copied=${slice.length}`);
   }
 
   /**
    * Write a buffer to a file
    */
   async write(path: string, buffer: Uint8Array, offset: number): Promise<void> {
-    rsLog('write', path, { offset, len: buffer.length });
+    this.logger.log('write', path, { offset, len: buffer.length });
     // For simplicity, we'll read the entire file, modify it, and write it back
     let existingData: Uint8Array;
 
@@ -1348,7 +1349,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     newData.set(buffer, offset);
 
     await this.writeFile(path, newData);
-    rsLogResult('write', path, `newSize=${newSize}`);
+    this.logger.logResult('write', path, `newSize=${newSize}`);
   }
 
   /**
@@ -1648,13 +1649,13 @@ export class RemoteStorageFileSystem extends FileSystem {
               const age = Date.now() - v.ts;
               console.log(`[RS-CACHE-LOAD]   restored dir[${k}]: ${m.size} entries=[${[...m.keys()].join(',')}] age=${age}ms etag=${v.etag ?? 'null'}`);
             }
-            rsLogResult('cache', 'load', `restored ${this.dirListingCache.size} dirs`);
+            this.logger.logResult('cache', 'load', `restored ${this.dirListingCache.size} dirs`);
             console.log(`[RS-CACHE-LOAD] backend=${this.backendName} total ${this.dirListingCache.size} dirs restored`);
           } else {
             console.log(`[RS-CACHE-LOAD] backend=${this.backendName} no persisted cache data found`);
           }
         } catch (err) {
-          rsLogResult('cache', 'load', err, false);
+          this.logger.logResult('cache', 'load', err, false);
           console.log(`[RS-CACHE-LOAD] backend=${this.backendName} FAILED to load: ${err}`);
         }
       })();
@@ -1707,10 +1708,10 @@ export class RemoteStorageFileSystem extends FileSystem {
       await this.storage!.save(blob);
       const dirSummary = Object.entries(out).map(([k, v]) => `${k}:[${Object.keys(v.entries).join(',')}]`).join(' ');
       console.log(`[RS-CACHE-SAVE] flushSave backend=${this.backendName}: persisted ${this.dirListingCache.size} dirs — ${dirSummary}`);
-      rsLogResult('cache', 'save', `persisted ${this.dirListingCache.size} dirs`);
+      this.logger.logResult('cache', 'save', `persisted ${this.dirListingCache.size} dirs`);
     } catch (err) {
       console.log(`[RS-CACHE-SAVE] flushSave backend=${this.backendName}: FAILED: ${err}`);
-      rsLogResult('cache', 'save', err, false);
+      this.logger.logResult('cache', 'save', err, false);
     }
   }
 
@@ -1746,18 +1747,18 @@ export class RemoteStorageFileSystem extends FileSystem {
         headers,
       });
       if (!response.ok) {
-        rsLogResult('writeMtimeSidecar', filePath, `status=${response.status}`, false);
+        this.logger.logResult('writeMtimeSidecar', filePath, `status=${response.status}`, false);
       } else {
         // Update in-memory cache
         const normalized = normalizePath(filePath);
         this.mtimeCache.set(normalized, mtime);
         // Persist to IndexedDB
         this.mtimeStore.set(normalized, mtime).catch(() => {});
-        rsLogResult('writeMtimeSidecar', filePath, `mtime=${mtime}`);
+        this.logger.logResult('writeMtimeSidecar', filePath, `mtime=${mtime}`);
       }
     } catch (error) {
       // Sidecar write failure is non-fatal — log and continue
-      rsLogResult('writeMtimeSidecar', filePath, error, false);
+      this.logger.logResult('writeMtimeSidecar', filePath, error, false);
     }
   }
 
@@ -1845,7 +1846,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       if (dirEntries !== null && !dirEntries.has(sidecarName)) {
         this.mtimeCache.delete(normalized);
         this.mtimeStore.delete(normalized).catch(() => {});
-        rsLogResult('deleteMtimeSidecar', filePath, 'skipped (not in dir listing)');
+        this.logger.logResult('deleteMtimeSidecar', filePath, 'skipped (not in dir listing)');
         return;
       }
     }
@@ -1860,7 +1861,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       if (sidecarDir) {
         this.mtimeCache.delete(normalized);
         this.mtimeStore.delete(normalized).catch(() => {});
-        rsLogResult('deleteMtimeSidecar', filePath, 'skipped (no cache, dir listing unavailable)');
+        this.logger.logResult('deleteMtimeSidecar', filePath, 'skipped (no cache, dir listing unavailable)');
         return;
       }
     }
@@ -1871,7 +1872,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       if (response.ok || response.status === 404) {
         this.mtimeCache.delete(normalized);
         this.mtimeStore.delete(normalized).catch(() => {});
-        rsLogResult('deleteMtimeSidecar', filePath, 'OK');
+        this.logger.logResult('deleteMtimeSidecar', filePath, 'OK');
       }
     } catch {
       // Non-fatal
@@ -1894,7 +1895,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * skipping the expensive full tree walk.
    */
   async shouldSync(): Promise<boolean> {
-    rsLog('shouldSync', '(snapshot check)');
+    this.logger.log('shouldSync', '(snapshot check)');
 
     // First call — try restoring from IndexedDB before building from scratch
     if (this.snapshot === null) {
@@ -1905,18 +1906,18 @@ export class RemoteStorageFileSystem extends FileSystem {
         // Snapshot restored — check if root ETag is still the same
         const currentRootEtag = await this.fetchRootEtag();
         if (currentRootEtag !== null && currentRootEtag === this.rootEtag) {
-          rsLogResult('shouldSync', '', 'false (snapshot restored from IDB, root ETag unchanged)');
+          this.logger.logResult('shouldSync', '', 'false (snapshot restored from IDB, root ETag unchanged)');
           return false;
         }
         // Root ETag changed (or unavailable) — rebuild snapshot with pruning
         await this.buildSnapshot();
-        rsLogResult('shouldSync', '', 'true (snapshot restored but root ETag changed)');
+        this.logger.logResult('shouldSync', '', 'true (snapshot restored but root ETag changed)');
         return true;
       }
 
       // No persisted snapshot — build one from scratch and signal full sync
       await this.buildSnapshot();
-      rsLogResult('shouldSync', '', 'true (first call, baseline built)');
+      this.logger.logResult('shouldSync', '', 'true (first call, baseline built)');
       return true;
     }
 
@@ -1924,18 +1925,18 @@ export class RemoteStorageFileSystem extends FileSystem {
     const currentRootEtag = await this.fetchRootEtag();
     if (currentRootEtag === null) {
       // Couldn't fetch root ETag — err on the side of syncing
-      rsLogResult('shouldSync', '', 'true (root ETag unavailable)');
+      this.logger.logResult('shouldSync', '', 'true (root ETag unavailable)');
       return true;
     }
 
     if (currentRootEtag === this.rootEtag) {
-      rsLogResult('shouldSync', '', 'false (root ETag unchanged)');
+      this.logger.logResult('shouldSync', '', 'false (root ETag unchanged)');
       return false;
     }
 
     // Root ETag changed — rebuild snapshot (with subtree pruning) and sync
     await this.buildSnapshot();
-    rsLogResult('shouldSync', '', 'true (root ETag changed)');
+    this.logger.logResult('shouldSync', '', 'true (root ETag changed)');
     return true;
   }
 
@@ -1967,7 +1968,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * the next session can skip the full tree walk if the root ETag is unchanged.
    */
   private async buildSnapshot(): Promise<void> {
-    rsLog('buildSnapshot', '(building ETag baseline)');
+    this.logger.log('buildSnapshot', '(building ETag baseline)');
 
     const previousSnapshot = this.snapshot;
     const previousRootEtag = this.rootEtag;
@@ -1980,7 +1981,7 @@ export class RemoteStorageFileSystem extends FileSystem {
 
     await this.buildSnapshotRecursive('/', previousSnapshot);
 
-    rsLogResult('buildSnapshot', '', `entries=${this.snapshot.size}`);
+    this.logger.logResult('buildSnapshot', '', `entries=${this.snapshot.size}`);
 
     // Persist snapshot and rootEtag to IndexedDB (fire-and-forget)
     this.persistSnapshotToIDB();
@@ -2009,7 +2010,7 @@ export class RemoteStorageFileSystem extends FileSystem {
           }
         }
         this.rootEtag = rootEtag ?? null;
-        rsLogResult('shouldSync', '', `restored snapshot from IDB: ${this.snapshot.size} entries, rootEtag=${this.rootEtag}`);
+        this.logger.logResult('shouldSync', '', `restored snapshot from IDB: ${this.snapshot.size} entries, rootEtag=${this.rootEtag}`);
       }
     } catch {
       // IndexedDB unavailable — fall through to building from scratch

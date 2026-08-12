@@ -1556,7 +1556,9 @@ export class RemoteStorageFileSystem extends FileSystem {
     }
 
     // 3. Cache miss — fetch from network
-    const dirUrl = this.buildUrl(normalized);
+    //    ensureDirectoryPath() adds trailing slash so buildUrl() generates a directory URL
+    //    (RemoteStorage requires directory URLs to end with '/')
+    const dirUrl = this.buildUrl(ensureDirectoryPath(normalized));
     loggers.dir.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: cache MISS, fetching ${dirUrl}`);
 
     const response = await this.makeRequest(dirUrl, {

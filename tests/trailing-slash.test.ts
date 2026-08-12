@@ -326,15 +326,19 @@ describe('Trailing slash handling', () => {
     });
 
     it('nested directory path gets trailing slash', async () => {
+      // ensureDirListing now recursively verifies parent directories,
+      // so we need to mock listings for every ancestor.
       mockFetch.mockImplementation((url: string) => {
-        if (url.endsWith('/deep/nested/dir/')) {
-          return Promise.resolve({
-            ok: true,
-            status: 200,
-            headers: new Map([['content-type', 'application/ld+json']]),
-            json: () => Promise.resolve({ '@graph': [] }),
-          });
-        }
+        const dirResponse = (items: string[]) => ({
+          ok: true,
+          status: 200,
+          headers: new Map([['content-type', 'application/ld+json']]),
+          json: () => Promise.resolve({ '@graph': items.map((name) => ({ '@id': name })) }),
+        });
+        if (url === baseUrl + '/app_data/configs/') return Promise.resolve(dirResponse(['deep/']));
+        if (url.endsWith('/deep/')) return Promise.resolve(dirResponse(['nested/']));
+        if (url.endsWith('/deep/nested/')) return Promise.resolve(dirResponse(['dir/']));
+        if (url.endsWith('/deep/nested/dir/')) return Promise.resolve(dirResponse([]));
         return Promise.resolve({ ok: false, status: 404, headers: new Map() });
       });
 

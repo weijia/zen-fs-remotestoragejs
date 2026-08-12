@@ -185,6 +185,10 @@ export class RemoteStorageFileSystem extends FileSystem {
         'zen-fs-remotestorage-cache',
         config.cacheFile,
       );
+      // Kick off cache loading immediately so it's ready by the time
+      // any method (exists, stat, etc.) needs it. ensureCacheLoaded()
+      // is memoized, so subsequent calls just await the same promise.
+      this.loadPromise = this.ensureCacheLoaded();
     }
 
     // IndexedDB persistence for snapshot and mtimeCache
@@ -301,6 +305,9 @@ export class RemoteStorageFileSystem extends FileSystem {
   async exists(path: string): Promise<boolean> {
     this.logger.log('exists', path);
     const normalized = normalizePath(path);
+
+    // Ensure persistent cache has been restored before checking/dumping state
+    await this.ensureCacheLoaded();
 
     // Full cache state dump for debugging
     loggers.exists.log(`[RS-EXISTS] exists(${path}) backend=${this.backendName}`);
@@ -956,6 +963,9 @@ export class RemoteStorageFileSystem extends FileSystem {
       this.logger.logResult('stat', path, 'Invalid path format', false);
       throw new RemoteStorageError('Invalid path format');
     }
+
+    // Ensure persistent cache has been restored before checking/dumping state
+    await this.ensureCacheLoaded();
 
     const callerSaysDir = path.endsWith('/');
     const baseName = getBasename(path);

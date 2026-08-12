@@ -1521,8 +1521,41 @@ export class RemoteStorageFileSystem extends FileSystem {
       return cached;
     }
 
-    // 2. Cache miss — fetch from network
+    // 2. Verify via parent directory listing that dirPath is actually a directory.
+    //    This avoids sending a pointless GET to a path that the parent listing
+    //    already knows is a file (isDir=false) or doesn't exist at all.
+    //    Root directory '/' has no parent — skip this check.
     const normalized = normalizePath(dirPath);
+    const parentPath = getParentPath(normalized);
+    if (parentPath) {
+      const parentDir = `/${parentPath}/`;
+      // Recursively ensure the parent directory listing is available.
+      // This will fetch it from the network if it's not cached yet.
+      const parentListing = await this.ensureDirListing(parentDir);
+      if (parentListing) {
+        const baseName = getBasename(normalized);
+        const entry = parentListing.get(baseName);
+        if (entry && !entry.isDir) {
+          // Parent listing says this path is a file, not a directory.
+          loggers.dir.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: parent listing says "${baseName}" is a file (isDir=false), skipping fetch`);
+          return null;
+        }
+        if (!entry) {
+          // Parent listing exists but doesn't contain this entry — directory doesn't exist.
+          loggers.dir.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: "${baseName}" not in parent listing, skipping fetch`);
+          return null;
+        }
+        // entry exists and isDir=true — proceed to fetch the directory listing
+        loggers.dir.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: parent listing confirms "${baseName}" is a directory, proceeding to fetch`);
+      }
+      // If parentListing is null (parent doesn't exist), this directory can't exist either.
+      if (parentListing === null) {
+        loggers.dir.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: parent directory "${parentDir}" does not exist, skipping fetch`);
+        return null;
+      }
+    }
+
+    // 3. Cache miss — fetch from network
     const dirUrl = this.buildUrl(normalized);
     loggers.dir.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: cache MISS, fetching ${dirUrl}`);
 
@@ -1539,7 +1572,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       this.handleHttpError(response, normalized, 'ensureDirListing');
     }
 
-    // 3. Parse response (JSON-LD or HTML fallback)
+    // 4. Parse response (JSON-LD or HTML fallback)
     const contentType = response.headers.get('content-type') || '';
     let entries: DirEntry[];
     if (contentType.includes('application/ld+json')) {
@@ -1588,7 +1621,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       entries = names.map(name => ({ name, isDir: name.endsWith('/'), etag: undefined }));
     }
 
-    // 4. Cache and return
+    // 5. Cache and return
     this.cacheDirListing(normalized, entries, response.headers.get('ETag'));
     const result = this.getCachedDirListing(normalized);
     loggers.dir.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: fetched and cached ${entries.length} entries (etag=${response.headers.get('ETag') ?? 'null'})`);

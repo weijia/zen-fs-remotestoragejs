@@ -557,79 +557,22 @@ export class RemoteStorageFileSystem extends FileSystem {
    */
   async readdir(path: string): Promise<string[]> {
     rsLog('readdir', path);
-    // Ensure cache is restored from storage before serving (cheap, memoized).
-    await this.ensureCacheLoaded();
     path = this.validateAndNormalizePath(path, true);
-    const dirUrl = this.buildUrl(path);
     try {
-      const response = await this.makeRequest(dirUrl, {
-        method: 'GET',
-        headers: { 'Accept': 'application/ld+json' },
-      });
-      if (!response.ok) {
-        if (response.status === 404) {
-          rsLogResult('readdir', path, 'DirectoryNotFoundError', false);
-          throw new DirectoryNotFoundError(path);
-        }
-        this.handleHttpError(response, path, 'readdir');
+      const entries = await this.ensureDirListing(path);
+      if (!entries) {
+        rsLogResult('readdir', path, 'DirectoryNotFoundError', false);
+        throw new DirectoryNotFoundError(path);
       }
-      const contentType = response.headers.get('content-type') || '';
-      let entries: DirEntry[];
-      if (contentType.includes('application/ld+json')) {
-        const listing = await response.json();
-        entries = [];
-        if (listing['@graph']) {
-          for (const item of listing['@graph']) {
-            if (item['@id'] && item['@id'] !== './') {
-              const rawName = item['@id'];
-              const isDir = rawName.endsWith('/');
-              const name = rawName.replace(/\/$/, '');
-              if (name) {
-                entries.push({
-                  name,
-                  isDir,
-                  etag: item['ETag'] ?? item['etag'],
-                  size: item['Content-Length'] != null
-                    ? Number(item['Content-Length'])
-                    : undefined,
-                  lastModified: item['Last-Modified'] ?? item['last-modified'],
-                });
-              }
-            }
-          }
-        } else if (listing['items'] && typeof listing['items'] === 'object') {
-          for (const entryKey of Object.keys(listing['items'])) {
-            if (entryKey && entryKey !== './') {
-              const isDir = entryKey.endsWith('/');
-              const name = entryKey.replace(/\/$/, '');
-              const item = listing['items'][entryKey];
-              entries.push({
-                name,
-                isDir,
-                etag: item?.ETag ?? item?.etag,
-                size: item?.['Content-Length'] != null
-                  ? Number(item['Content-Length'])
-                  : undefined,
-                lastModified: item?.['Last-Modified'] ?? item?.['last-modified'],
-              });
-            }
-          }
-        }
-      } else {
-        const html = await response.text();
-        const names = this.parseHtmlDirectoryListing(html);
-        entries = names.map(name => ({ name, isDir: name.endsWith('/'), etag: undefined }));
-      }
-      // Cache the FULL directory listing (including sidecar files) so that
-      // readMtimeSidecar() can check existence without a 404 request.
-      // Only filter sidecars from the returned names array.
-      this.cacheDirListing(path, entries, response.headers.get('ETag'));
-      console.log(`[RS-READDIR] readdir(${path}) backend=${this.backendName}: cached ${entries.length} entries (etag=${response.headers.get('ETag') ?? 'null'}), returning ${entries.filter(e => !isMtimeSidecar(e.name)).length} visible names`);
 
       // Filter out .mtime sidecar files from the returned names — they are
       // internal to RemoteStorageFileSystem and invisible to upper layers.
-      const filtered = entries.filter(e => !isMtimeSidecar(e.name));
-      const names = filtered.map(e => e.name);
+      const names: string[] = [];
+      for (const [name] of entries) {
+        if (!isMtimeSidecar(name)) names.push(name);
+      }
+
+      console.log(`[RS-READDIR] readdir(${path}) backend=${this.backendName}: ${entries.size} entries, returning ${names.length} visible names`);
       rsLogResult('readdir', path, `count=${names.length} [${names.join(', ')}]`);
       this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
       return names;
@@ -1029,21 +972,14 @@ export class RemoteStorageFileSystem extends FileSystem {
     if (baseName) {
       const parentPath = getParentPath(path);
       const parentDir = parentPath ? `/${parentPath}/` : '/';
-      let entries = this.getCachedDirListing(parentDir);
-      const listingAge = this.getDirListingAge(parentDir);
-      console.log(`[RS-STAT] stat(${path}): dir listing cache for ${parentDir} → ${entries ? `${entries.size} entries, age=${listingAge}ms` : 'MISS'}`);
-      if (entries === null) {
-        // Cache miss — fetch directory listing once, cache it for siblings
-        try {
-          console.log(`[RS-STAT] stat(${path}): fetching readdir(${parentDir})`);
-          await this.readdir(parentDir);
-          entries = this.getCachedDirListing(parentDir);
-          const newAge = this.getDirListingAge(parentDir);
-          console.log(`[RS-STAT] stat(${path}): readdir returned, cache now → ${entries ? `${entries.size} entries, age=${newAge}ms` : 'still MISS'}`);
-        } catch {
-          entries = null; // parent dir doesn't exist or can't be read
-          console.log(`[RS-STAT] stat(${path}): readdir(${parentDir}) FAILED`);
-        }
+      let entries: Map<string, DirEntry> | null = null;
+      try {
+        entries = await this.ensureDirListing(parentDir);
+        const listingAge = this.getDirListingAge(parentDir);
+        console.log(`[RS-STAT] stat(${path}): ensureDirListing(${parentDir}) → ${entries ? `${entries.size} entries, age=${listingAge}ms` : 'null (dir not found)'}`);
+      } catch (err) {
+        console.log(`[RS-STAT] stat(${path}): ensureDirListing(${parentDir}) FAILED: ${err}`);
+        entries = null;
       }
       if (entries) {
         dirListingAvailable = true;
@@ -1304,27 +1240,31 @@ export class RemoteStorageFileSystem extends FileSystem {
     if (!isDir && baseName) {
       const parentPath = getParentPath(path);
       const parentDir = parentPath ? `/${parentPath}/` : '/';
-      const entries = this.getCachedDirListing(parentDir);
-      rsLog('getRevision', path, {
-        dirCheck: 'looking-up-parent',
-        parentDir,
-        hasCache: entries !== null,
-        cacheKeys: entries ? [...entries.keys()] : null,
-      });
-      if (entries) {
-        const entry = entries.get(baseName);
+      try {
+        const entries = await this.ensureDirListing(parentDir);
         rsLog('getRevision', path, {
-          dirCheck: 'parent-cache-hit',
-          baseName,
-          found: !!entry,
-          isDir: entry?.isDir,
+          dirCheck: 'ensureDirListing',
+          parentDir,
+          hasCache: entries !== null,
+          cacheKeys: entries ? [...entries.keys()] : null,
         });
-        if (entry?.isDir) {
-          isDir = true;
-          dirCheckSource = 'parent-listing';
+        if (entries) {
+          const entry = entries.get(baseName);
+          rsLog('getRevision', path, {
+            dirCheck: 'parent-listing-hit',
+            baseName,
+            found: !!entry,
+            isDir: entry?.isDir,
+          });
+          if (entry?.isDir) {
+            isDir = true;
+            dirCheckSource = 'parent-listing';
+          }
+        } else {
+          rsLog('getRevision', path, { dirCheck: 'parent-dir-not-found' });
         }
-      } else {
-        rsLog('getRevision', path, { dirCheck: 'parent-cache-miss' });
+      } catch (err) {
+        rsLog('getRevision', path, { dirCheck: 'ensureDirListing-error', error: String(err) });
       }
     }
 
@@ -1560,6 +1500,98 @@ export class RemoteStorageFileSystem extends FileSystem {
     }
     this.dirListingCache.set(key, { etag: dirEtag, ts: Date.now(), entries: map });
     this.scheduleSave();
+  }
+
+  /**
+   * Ensure a directory listing is in the cache, fetching from the network if
+   * necessary. This is the single shared entry point used by readdir(),
+   * stat(), and getRevision() to obtain directory entries.
+   *
+   * @param dirPath Directory path (with or without trailing slash)
+   * @returns The cached entries map, or `null` if the directory doesn't exist (404)
+   */
+  private async ensureDirListing(dirPath: string): Promise<Map<string, DirEntry> | null> {
+    await this.ensureCacheLoaded();
+
+    // 1. Check cache first
+    const cached = this.getCachedDirListing(dirPath);
+    if (cached) {
+      console.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: cache HIT (${cached.size} entries)`);
+      return cached;
+    }
+
+    // 2. Cache miss — fetch from network
+    const normalized = normalizePath(dirPath);
+    const dirUrl = this.buildUrl(normalized);
+    console.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: cache MISS, fetching ${dirUrl}`);
+
+    const response = await this.makeRequest(dirUrl, {
+      method: 'GET',
+      headers: { 'Accept': 'application/ld+json' },
+    });
+
+    if (!response.ok) {
+      if (response.status === 404) {
+        console.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: 404 — directory not found`);
+        return null;
+      }
+      this.handleHttpError(response, normalized, 'ensureDirListing');
+    }
+
+    // 3. Parse response (JSON-LD or HTML fallback)
+    const contentType = response.headers.get('content-type') || '';
+    let entries: DirEntry[];
+    if (contentType.includes('application/ld+json')) {
+      const listing = await response.json();
+      entries = [];
+      if (listing['@graph']) {
+        for (const item of listing['@graph']) {
+          if (item['@id'] && item['@id'] !== './') {
+            const rawName = item['@id'];
+            const isDir = rawName.endsWith('/');
+            const name = rawName.replace(/\/$/, '');
+            if (name) {
+              entries.push({
+                name,
+                isDir,
+                etag: item['ETag'] ?? item['etag'],
+                size: item['Content-Length'] != null
+                  ? Number(item['Content-Length'])
+                  : undefined,
+                lastModified: item['Last-Modified'] ?? item['last-modified'],
+              });
+            }
+          }
+        }
+      } else if (listing['items'] && typeof listing['items'] === 'object') {
+        for (const entryKey of Object.keys(listing['items'])) {
+          if (entryKey && entryKey !== './') {
+            const isDir = entryKey.endsWith('/');
+            const name = entryKey.replace(/\/$/, '');
+            const item = listing['items'][entryKey];
+            entries.push({
+              name,
+              isDir,
+              etag: item?.ETag ?? item?.etag,
+              size: item?.['Content-Length'] != null
+                ? Number(item['Content-Length'])
+                : undefined,
+              lastModified: item?.['Last-Modified'] ?? item?.['last-modified'],
+            });
+          }
+        }
+      }
+    } else {
+      const html = await response.text();
+      const names = this.parseHtmlDirectoryListing(html);
+      entries = names.map(name => ({ name, isDir: name.endsWith('/'), etag: undefined }));
+    }
+
+    // 4. Cache and return
+    this.cacheDirListing(normalized, entries, response.headers.get('ETag'));
+    const result = this.getCachedDirListing(normalized);
+    console.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: fetched and cached ${entries.length} entries (etag=${response.headers.get('ETag') ?? 'null'})`);
+    return result;
   }
 
   /**

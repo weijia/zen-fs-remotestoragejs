@@ -26,7 +26,7 @@ import {
   mtimePathFor,
   isMtimeSidecar,
 } from './utils.js';
-import { createLogger } from './debug.js';
+import { createLogger, loggers } from './debug.js';
 import { createCacheStorage, CacheStorage } from './persistence.js';
 import { IdbKVStore } from 'zen-fs-cache';
 
@@ -303,8 +303,8 @@ export class RemoteStorageFileSystem extends FileSystem {
     const normalized = normalizePath(path);
 
     // Full cache state dump for debugging
-    console.log(`[RS-EXISTS] exists(${path}) backend=${this.backendName}`);
-    console.log(`[RS-EXISTS]   cache state: ${this.dumpCacheState(path)}`);
+    loggers.exists.log(`[RS-EXISTS] exists(${path}) backend=${this.backendName}`);
+    loggers.exists.log(`[RS-EXISTS]   cache state: ${this.dumpCacheState(path)}`);
 
     // Check existenceCache first
     const cached = this.existenceCache.get(normalized);
@@ -312,40 +312,40 @@ export class RemoteStorageFileSystem extends FileSystem {
       if (cached.exists) {
         // Positive result: respect TTL
         if (Date.now() - cached.ts < RemoteStorageFileSystem.POSITIVE_CACHE_TTL) {
-          console.log(`[RS-EXISTS]   → true (existenceCache HIT: positive, age=${Date.now() - cached.ts}ms < ${RemoteStorageFileSystem.POSITIVE_CACHE_TTL}ms)`);
+          loggers.exists.log(`[RS-EXISTS]   → true (existenceCache HIT: positive, age=${Date.now() - cached.ts}ms < ${RemoteStorageFileSystem.POSITIVE_CACHE_TTL}ms)`);
           this.logger.logResult('exists', path, true, true);
           return true;
         }
-        console.log(`[RS-EXISTS]   existenceCache positive EXPIRED (age=${Date.now() - cached.ts}ms), falling through to stat()`);
+        loggers.exists.log(`[RS-EXISTS]   existenceCache positive EXPIRED (age=${Date.now() - cached.ts}ms), falling through to stat()`);
         // Positive cache expired — fall through to fresh stat() check
       } else {
         // Negative result: respect TTL
         if (Date.now() - cached.ts < RemoteStorageFileSystem.NEGATIVE_CACHE_TTL) {
-          console.log(`[RS-EXISTS]   → false (existenceCache HIT: negative, age=${Date.now() - cached.ts}ms < ${RemoteStorageFileSystem.NEGATIVE_CACHE_TTL}ms)`);
+          loggers.exists.log(`[RS-EXISTS]   → false (existenceCache HIT: negative, age=${Date.now() - cached.ts}ms < ${RemoteStorageFileSystem.NEGATIVE_CACHE_TTL}ms)`);
           this.logger.logResult('exists', path, false, true);
           return false;
         }
-        console.log(`[RS-EXISTS]   existenceCache negative EXPIRED (age=${Date.now() - cached.ts}ms), falling through to stat()`);
+        loggers.exists.log(`[RS-EXISTS]   existenceCache negative EXPIRED (age=${Date.now() - cached.ts}ms), falling through to stat()`);
       }
     } else {
-      console.log(`[RS-EXISTS]   existenceCache MISS for ${normalized}, calling stat()`);
+      loggers.exists.log(`[RS-EXISTS]   existenceCache MISS for ${normalized}, calling stat()`);
     }
 
     try {
-      console.log(`[RS-EXISTS]   calling stat(${path})...`);
+      loggers.exists.log(`[RS-EXISTS]   calling stat(${path})...`);
       await this.stat(path);
       this.existenceCache.set(normalized, { exists: true, ts: Date.now() });
-      console.log(`[RS-EXISTS]   → true (stat() succeeded, existenceCache updated)`);
+      loggers.exists.log(`[RS-EXISTS]   → true (stat() succeeded, existenceCache updated)`);
       this.logger.logResult('exists', path, true);
       return true;
     } catch (error) {
       if (error instanceof FileNotFoundError) {
         this.existenceCache.set(normalized, { exists: false, ts: Date.now() });
-        console.log(`[RS-EXISTS]   → false (stat() threw FileNotFoundError, existenceCache updated)`);
+        loggers.exists.log(`[RS-EXISTS]   → false (stat() threw FileNotFoundError, existenceCache updated)`);
         this.logger.logResult('exists', path, false);
         return false;
       }
-      console.log(`[RS-EXISTS]   → ERROR: ${error instanceof Error ? error.message : String(error)}`);
+      loggers.exists.log(`[RS-EXISTS]   → ERROR: ${error instanceof Error ? error.message : String(error)}`);
       this.logger.logResult('exists', path, error, false);
       throw error;
     }
@@ -489,26 +489,26 @@ export class RemoteStorageFileSystem extends FileSystem {
     // Never skip based on dir listing alone — it may be stale.
     // If unsure, just send DELETE — 404 is handled as success (idempotent).
     const existCached = this.existenceCache.get(normalized);
-    console.log(`[RS-UNLINK] unlink(${path}) backend=${this.backendName} normalized=${normalized} existenceCache → ${existCached ? `exists=${existCached.exists} age=${Date.now() - existCached.ts}ms` : 'MISS'}`);
-    console.log(`[RS-UNLINK]   cache state: ${this.dumpCacheState(path)}`);
+    loggers.delete.log(`[RS-UNLINK] unlink(${path}) backend=${this.backendName} normalized=${normalized} existenceCache → ${existCached ? `exists=${existCached.exists} age=${Date.now() - existCached.ts}ms` : 'MISS'}`);
+    loggers.delete.log(`[RS-UNLINK]   cache state: ${this.dumpCacheState(path)}`);
     if (existCached && !existCached.exists) {
       if (Date.now() - existCached.ts < RemoteStorageFileSystem.NEGATIVE_CACHE_TTL) {
-        console.log(`[RS-UNLINK] unlink(${path}): SKIPPED (existence cache: not found, within TTL)`);
+        loggers.delete.log(`[RS-UNLINK] unlink(${path}): SKIPPED (existence cache: not found, within TTL)`);
         this.logger.logResult('unlink', path, 'skipped (existence cache: not found)');
         return;
       }
-      console.log(`[RS-UNLINK] unlink(${path}): negative cache expired, proceeding to DELETE`);
+      loggers.delete.log(`[RS-UNLINK] unlink(${path}): negative cache expired, proceeding to DELETE`);
     }
 
-    console.log(`[RS-UNLINK] unlink(${path}): sending DELETE`);
+    loggers.delete.log(`[RS-UNLINK] unlink(${path}): sending DELETE`);
     try {
       const url = this.buildUrl(path);
       const response = await this.makeRequest(url, { method: 'DELETE' });
-      console.log(`[RS-UNLINK] unlink(${path}): DELETE response status=${response.status}`);
+      loggers.delete.log(`[RS-UNLINK] unlink(${path}): DELETE response status=${response.status}`);
 
       // 404 on DELETE = file already gone = success (idempotent)
       if (response.status === 404) {
-        console.log(`[RS-UNLINK] unlink(${path}): 404 — already deleted, treating as success`);
+        loggers.delete.log(`[RS-UNLINK] unlink(${path}): 404 — already deleted, treating as success`);
         this.logger.logResult('unlink', path, '404 — already deleted, treating as success');
         this.removeFromExistenceCache(path);
         const parentPath = getParentPath(path);
@@ -573,7 +573,7 @@ export class RemoteStorageFileSystem extends FileSystem {
         if (!isMtimeSidecar(name)) names.push(name);
       }
 
-      console.log(`[RS-READDIR] readdir(${path}) backend=${this.backendName}: ${entries.size} entries, returning ${names.length} visible names`);
+      loggers.dir.log(`[RS-READDIR] readdir(${path}) backend=${this.backendName}: ${entries.size} entries, returning ${names.length} visible names`);
       this.logger.logResult('readdir', path, `count=${names.length} [${names.join(', ')}]`);
       this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
       return names;
@@ -959,8 +959,8 @@ export class RemoteStorageFileSystem extends FileSystem {
 
     const callerSaysDir = path.endsWith('/');
     const baseName = getBasename(path);
-    console.log(`[RS-STAT] stat ENTER(${path}) backend=${this.backendName} baseName=${baseName} callerSaysDir=${callerSaysDir}`);
-    console.log(`[RS-STAT]   cache state: ${this.dumpCacheState(path)}`);
+    loggers.stat.log(`[RS-STAT] stat ENTER(${path}) backend=${this.backendName} baseName=${baseName} callerSaysDir=${callerSaysDir}`);
+    loggers.stat.log(`[RS-STAT]   cache state: ${this.dumpCacheState(path)}`);
 
     // ---- Stage 0: Existence check via directory listing ----
     // Before any HEAD/GET, check the cached (or freshly fetched) parent
@@ -977,9 +977,9 @@ export class RemoteStorageFileSystem extends FileSystem {
       try {
         entries = await this.ensureDirListing(parentDir);
         const listingAge = this.getDirListingAge(parentDir);
-        console.log(`[RS-STAT] stat(${path}): ensureDirListing(${parentDir}) → ${entries ? `${entries.size} entries, age=${listingAge}ms` : 'null (dir not found)'}`);
+        loggers.stat.log(`[RS-STAT] stat(${path}): ensureDirListing(${parentDir}) → ${entries ? `${entries.size} entries, age=${listingAge}ms` : 'null (dir not found)'}`);
       } catch (err) {
-        console.log(`[RS-STAT] stat(${path}): ensureDirListing(${parentDir}) FAILED: ${err}`);
+        loggers.stat.log(`[RS-STAT] stat(${path}): ensureDirListing(${parentDir}) FAILED: ${err}`);
         entries = null;
       }
       if (entries) {
@@ -988,9 +988,9 @@ export class RemoteStorageFileSystem extends FileSystem {
         if (cachedEntry) {
           existsViaDir = true;
           isDirViaDir = cachedEntry.isDir;
-          console.log(`[RS-STAT] stat(${path}): FOUND in dir listing (isDir=${isDirViaDir}, size=${cachedEntry.size ?? 'undefined'})`);
+          loggers.stat.log(`[RS-STAT] stat(${path}): FOUND in dir listing (isDir=${isDirViaDir}, size=${cachedEntry.size ?? 'undefined'})`);
         } else {
-          console.log(`[RS-STAT] stat(${path}): NOT in dir listing (entries: ${[...entries.keys()].join(', ')})`);
+          loggers.stat.log(`[RS-STAT] stat(${path}): NOT in dir listing (entries: ${[...entries.keys()].join(', ')})`);
         }
       }
     }
@@ -1008,13 +1008,13 @@ export class RemoteStorageFileSystem extends FileSystem {
       const parentDir = parentPath ? `/${parentPath}/` : '/';
       const listingAge = this.getDirListingAge(parentDir);
       if (listingAge !== null && listingAge < RemoteStorageFileSystem.POSITIVE_CACHE_TTL) {
-        console.log(`[RS-STAT] stat(${path}): → FileNotFoundError (not in FRESH dir listing, age=${listingAge}ms < ${RemoteStorageFileSystem.POSITIVE_CACHE_TTL}ms)`);
+        loggers.stat.log(`[RS-STAT] stat(${path}): → FileNotFoundError (not in FRESH dir listing, age=${listingAge}ms < ${RemoteStorageFileSystem.POSITIVE_CACHE_TTL}ms)`);
         this.logger.logResult('stat', path, 'FileNotFoundError (not in fresh dir listing)', false);
         throw new FileNotFoundError(path);
       }
       // Listing is stale — file might have been created externally.
       // Fall through to HEAD probe to verify.
-      console.log(`[RS-STAT] stat(${path}): not in STALE dir listing (age=${listingAge}ms >= ${RemoteStorageFileSystem.POSITIVE_CACHE_TTL}ms), falling through to HEAD probe`);
+      loggers.stat.log(`[RS-STAT] stat(${path}): not in STALE dir listing (age=${listingAge}ms >= ${RemoteStorageFileSystem.POSITIVE_CACHE_TTL}ms), falling through to HEAD probe`);
     }
 
     // If the caller explicitly passes a trailing slash, they already know
@@ -1027,16 +1027,16 @@ export class RemoteStorageFileSystem extends FileSystem {
     const needMetadata = !cachedEntry || cachedEntry.size === undefined;
     const shouldTryHead = !callerSaysDir && this.headSupported !== false
       && !isDirViaDir && needMetadata;
-    console.log(`[RS-STAT] stat(${path}): shouldTryHead=${shouldTryHead} (callerSaysDir=${callerSaysDir} headSupported=${this.headSupported} isDirViaDir=${isDirViaDir} needMetadata=${needMetadata})`);
+    loggers.stat.log(`[RS-STAT] stat(${path}): shouldTryHead=${shouldTryHead} (callerSaysDir=${callerSaysDir} headSupported=${this.headSupported} isDirViaDir=${isDirViaDir} needMetadata=${needMetadata})`);
     if (shouldTryHead) {
       // ---- Stage 1: HEAD probe (metadata / existence verification) ----
       // Fetch metadata via HEAD. This also serves as an existence check
       // when the dir listing was stale and the file wasn't in it.
       const fileUrl = this.buildUrl(path);
-      console.log(`[RS-STAT] stat(${path}): sending HEAD ${fileUrl}`);
+      loggers.stat.log(`[RS-STAT] stat(${path}): sending HEAD ${fileUrl}`);
       try {
         const response = await this.makeRequest(fileUrl, { method: 'HEAD' });
-        console.log(`[RS-STAT] stat(${path}): HEAD response status=${response.status}`);
+        loggers.stat.log(`[RS-STAT] stat(${path}): HEAD response status=${response.status}`);
         if (response.ok) {
           this.headSupported = true;
           const contentType = response.headers.get('content-type') || '';
@@ -1058,7 +1058,7 @@ export class RemoteStorageFileSystem extends FileSystem {
               size, mtimeMs: mtime, ctimeMs: mtime, atimeMs: mtime, birthtimeMs: mtime, nlink: 1,
             };
             this.logger.logResult('stat', path, `FILE mode=${result.mode.toString(8)} size=${size}`);
-            console.log(`[RS-STAT] stat(${path}): returning via HEAD OK (size=${size}), setting existenceCache=true`);
+            loggers.stat.log(`[RS-STAT] stat(${path}): returning via HEAD OK (size=${size}), setting existenceCache=true`);
             this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
             return result;
           }
@@ -1071,11 +1071,11 @@ export class RemoteStorageFileSystem extends FileSystem {
         } else if (response.status === 404) {
           // HEAD 404 = file confirmed not to exist. Set negative existence
           // cache so subsequent exists() calls can skip the HEAD probe.
-          console.log(`[RS-STAT] stat(${path}): HEAD 404 — file confirmed not found, setting existenceCache=false`);
+          loggers.stat.log(`[RS-STAT] stat(${path}): HEAD 404 — file confirmed not found, setting existenceCache=false`);
           this.existenceCache.set(normalizePath(path), { exists: false, ts: Date.now() });
         }
         this.logger.log('stat', path, { headStatus: response.status, fallingThrough: 'readdir stat' });
-        console.log(`[RS-STAT] stat(${path}): HEAD status=${response.status}, falling through to stage 2`);
+        loggers.stat.log(`[RS-STAT] stat(${path}): HEAD status=${response.status}, falling through to stage 2`);
       } catch (error) {
         if (error instanceof AuthenticationError || error instanceof PermissionDeniedError) {
           throw error;
@@ -1089,7 +1089,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     // File confirmed as directory via listing
     if (existsViaDir && isDirViaDir) {
       this.logger.logResult('stat', path, `DIR mode=40755 (via dir listing)`);
-      console.log(`[RS-STAT] stat(${path}): returning via dir listing (isDir), setting existenceCache=true`);
+      loggers.stat.log(`[RS-STAT] stat(${path}): returning via dir listing (isDir), setting existenceCache=true`);
       this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
       return { ino: 0, mode: 0o040755, uid: 0, gid: 0, size: 0,
         mtimeMs: Date.now(), ctimeMs: Date.now(), atimeMs: Date.now(), birthtimeMs: Date.now(), nlink: 1 };
@@ -1113,7 +1113,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       }
 
       this.logger.logResult('stat', path, `FILE mode=100644 (via dir listing, size=${size})`);
-      console.log(`[RS-STAT] stat(${path}): returning via dir listing (file, size=${size}), setting existenceCache=true`);
+      loggers.stat.log(`[RS-STAT] stat(${path}): returning via dir listing (file, size=${size}), setting existenceCache=true`);
       this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
       return { ino: 0, mode: 0o100644, uid: 0, gid: 0, size,
         mtimeMs: mtime, ctimeMs: mtime, atimeMs: mtime, birthtimeMs: mtime, nlink: 1 };
@@ -1123,18 +1123,18 @@ export class RemoteStorageFileSystem extends FileSystem {
     // fall back to directory probe (trailing slash GET) as last resort.
     const dirPath = path.endsWith('/') ? path : path + '/';
     const dirUrl = this.buildUrl(dirPath);
-    console.log(`[RS-STAT] stat(${path}): trying dir probe GET ${dirUrl}`);
+    loggers.stat.log(`[RS-STAT] stat(${path}): trying dir probe GET ${dirUrl}`);
     try {
       const response = await this.makeRequest(dirUrl, {
         method: 'GET',
         headers: { 'Accept': 'application/ld+json' },
       });
-      console.log(`[RS-STAT] stat(${path}): dir probe response status=${response.status}`);
+      loggers.stat.log(`[RS-STAT] stat(${path}): dir probe response status=${response.status}`);
       if (response.ok) {
         const contentType = response.headers.get('content-type') || '';
         if (contentType.includes('application/ld+json') || contentType.includes('text/html')) {
           this.logger.logResult('stat', path, `DIR mode=40755 (via dir probe)`);
-          console.log(`[RS-STAT] stat(${path}): returning via dir probe, setting existenceCache=true`);
+          loggers.stat.log(`[RS-STAT] stat(${path}): returning via dir probe, setting existenceCache=true`);
           this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
           return { ino: 0, mode: 0o040755, uid: 0, gid: 0, size: 0,
             mtimeMs: Date.now(), ctimeMs: Date.now(), atimeMs: Date.now(), birthtimeMs: Date.now(), nlink: 1 };
@@ -1150,7 +1150,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     }
 
     this.logger.logResult('stat', path, 'FileNotFoundError', false);
-    console.log(`[RS-STAT] stat(${path}): → FileNotFoundError (all paths exhausted)`);
+    loggers.stat.log(`[RS-STAT] stat(${path}): → FileNotFoundError (all paths exhausted)`);
     throw new FileNotFoundError(path);
   }
 
@@ -1517,14 +1517,14 @@ export class RemoteStorageFileSystem extends FileSystem {
     // 1. Check cache first
     const cached = this.getCachedDirListing(dirPath);
     if (cached) {
-      console.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: cache HIT (${cached.size} entries)`);
+      loggers.dir.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: cache HIT (${cached.size} entries)`);
       return cached;
     }
 
     // 2. Cache miss — fetch from network
     const normalized = normalizePath(dirPath);
     const dirUrl = this.buildUrl(normalized);
-    console.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: cache MISS, fetching ${dirUrl}`);
+    loggers.dir.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: cache MISS, fetching ${dirUrl}`);
 
     const response = await this.makeRequest(dirUrl, {
       method: 'GET',
@@ -1533,7 +1533,7 @@ export class RemoteStorageFileSystem extends FileSystem {
 
     if (!response.ok) {
       if (response.status === 404) {
-        console.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: 404 — directory not found`);
+        loggers.dir.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: 404 — directory not found`);
         return null;
       }
       this.handleHttpError(response, normalized, 'ensureDirListing');
@@ -1591,7 +1591,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     // 4. Cache and return
     this.cacheDirListing(normalized, entries, response.headers.get('ETag'));
     const result = this.getCachedDirListing(normalized);
-    console.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: fetched and cached ${entries.length} entries (etag=${response.headers.get('ETag') ?? 'null'})`);
+    loggers.dir.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: fetched and cached ${entries.length} entries (etag=${response.headers.get('ETag') ?? 'null'})`);
     return result;
   }
 
@@ -1611,16 +1611,16 @@ export class RemoteStorageFileSystem extends FileSystem {
     const key = normalizePath(parentDir);
     const cached = this.dirListingCache.get(key);
     if (!cached) {
-      console.log(`[RS-PATCH] patchDirListingEntry(${parentDir}, ${name}, ${entry ? 'add' : 'delete'}) backend=${this.backendName}: dir NOT in cache, nothing to patch`);
+      loggers.dir.log(`[RS-PATCH] patchDirListingEntry(${parentDir}, ${name}, ${entry ? 'add' : 'delete'}) backend=${this.backendName}: dir NOT in cache, nothing to patch`);
       return; // nothing cached for this dir; will be fetched on demand
     }
     if (entry === null) {
       const had = cached.entries.has(name);
       cached.entries.delete(name);
-      console.log(`[RS-PATCH] patchDirListingEntry(${parentDir}, ${name}, DELETE) backend=${this.backendName}: hadEntry=${had}, remaining entries=[${[...cached.entries.keys()].join(',')}], scheduling save`);
+      loggers.dir.log(`[RS-PATCH] patchDirListingEntry(${parentDir}, ${name}, DELETE) backend=${this.backendName}: hadEntry=${had}, remaining entries=[${[...cached.entries.keys()].join(',')}], scheduling save`);
     } else {
       cached.entries.set(name, entry);
-      console.log(`[RS-PATCH] patchDirListingEntry(${parentDir}, ${name}, ADD) backend=${this.backendName}: entries now=[${[...cached.entries.keys()].join(',')}], scheduling save`);
+      loggers.dir.log(`[RS-PATCH] patchDirListingEntry(${parentDir}, ${name}, ADD) backend=${this.backendName}: entries now=[${[...cached.entries.keys()].join(',')}], scheduling save`);
     }
     cached.ts = Date.now();
     this.scheduleSave();
@@ -1639,7 +1639,7 @@ export class RemoteStorageFileSystem extends FileSystem {
           const data = blob[this.cacheNamespace];
           if (data && typeof data === 'object') {
             const parsed = data as Record<string, { etag: string | null; ts: number; entries: Record<string, DirEntry> }>;
-            console.log(`[RS-CACHE-LOAD] backend=${this.backendName} loading persisted dirListingCache from storage...`);
+            loggers.cache.log(`[RS-CACHE-LOAD] backend=${this.backendName} loading persisted dirListingCache from storage...`);
             for (const [k, v] of Object.entries(parsed)) {
               const m = new Map<string, DirEntry>();
               for (const [name, e] of Object.entries(v.entries)) {
@@ -1647,16 +1647,16 @@ export class RemoteStorageFileSystem extends FileSystem {
               }
               this.dirListingCache.set(k, { etag: v.etag, ts: v.ts, entries: m });
               const age = Date.now() - v.ts;
-              console.log(`[RS-CACHE-LOAD]   restored dir[${k}]: ${m.size} entries=[${[...m.keys()].join(',')}] age=${age}ms etag=${v.etag ?? 'null'}`);
+              loggers.cache.log(`[RS-CACHE-LOAD]   restored dir[${k}]: ${m.size} entries=[${[...m.keys()].join(',')}] age=${age}ms etag=${v.etag ?? 'null'}`);
             }
             this.logger.logResult('cache', 'load', `restored ${this.dirListingCache.size} dirs`);
-            console.log(`[RS-CACHE-LOAD] backend=${this.backendName} total ${this.dirListingCache.size} dirs restored`);
+            loggers.cache.log(`[RS-CACHE-LOAD] backend=${this.backendName} total ${this.dirListingCache.size} dirs restored`);
           } else {
-            console.log(`[RS-CACHE-LOAD] backend=${this.backendName} no persisted cache data found`);
+            loggers.cache.log(`[RS-CACHE-LOAD] backend=${this.backendName} no persisted cache data found`);
           }
         } catch (err) {
           this.logger.logResult('cache', 'load', err, false);
-          console.log(`[RS-CACHE-LOAD] backend=${this.backendName} FAILED to load: ${err}`);
+          loggers.cache.log(`[RS-CACHE-LOAD] backend=${this.backendName} FAILED to load: ${err}`);
         }
       })();
     }
@@ -1669,10 +1669,10 @@ export class RemoteStorageFileSystem extends FileSystem {
   private scheduleSave(): void {
     if (!this.persistCache || !this.storage) return;
     if (this.saveTimer) {
-      console.log(`[RS-CACHE-SAVE] scheduleSave backend=${this.backendName}: timer already pending (debounce), skipping`);
+      loggers.cache.log(`[RS-CACHE-SAVE] scheduleSave backend=${this.backendName}: timer already pending (debounce), skipping`);
       return; // already scheduled
     }
-    console.log(`[RS-CACHE-SAVE] scheduleSave backend=${this.backendName}: scheduling flushSave in 500ms`);
+    loggers.cache.log(`[RS-CACHE-SAVE] scheduleSave backend=${this.backendName}: scheduling flushSave in 500ms`);
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
       void this.flushSave();
@@ -1688,7 +1688,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
-      console.log(`[RS-CACHE-SAVE] flushSaveNow backend=${this.backendName}: cancelled pending debounce timer`);
+      loggers.cache.log(`[RS-CACHE-SAVE] flushSaveNow backend=${this.backendName}: cancelled pending debounce timer`);
     }
     await this.flushSave();
   }
@@ -1707,10 +1707,10 @@ export class RemoteStorageFileSystem extends FileSystem {
       blob[this.cacheNamespace] = out;
       await this.storage!.save(blob);
       const dirSummary = Object.entries(out).map(([k, v]) => `${k}:[${Object.keys(v.entries).join(',')}]`).join(' ');
-      console.log(`[RS-CACHE-SAVE] flushSave backend=${this.backendName}: persisted ${this.dirListingCache.size} dirs — ${dirSummary}`);
+      loggers.cache.log(`[RS-CACHE-SAVE] flushSave backend=${this.backendName}: persisted ${this.dirListingCache.size} dirs — ${dirSummary}`);
       this.logger.logResult('cache', 'save', `persisted ${this.dirListingCache.size} dirs`);
     } catch (err) {
-      console.log(`[RS-CACHE-SAVE] flushSave backend=${this.backendName}: FAILED: ${err}`);
+      loggers.cache.log(`[RS-CACHE-SAVE] flushSave backend=${this.backendName}: FAILED: ${err}`);
       this.logger.logResult('cache', 'save', err, false);
     }
   }

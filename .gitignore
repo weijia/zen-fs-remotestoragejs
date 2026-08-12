@@ -67,3 +67,4 @@ playwright-report/
 *.tgz
 result.txt
 vitest_out.txt
+.zen-fs-remotestorage-cache.json

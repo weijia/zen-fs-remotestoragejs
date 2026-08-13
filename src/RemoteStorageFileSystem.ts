@@ -1543,11 +1543,13 @@ export class RemoteStorageFileSystem extends FileSystem {
     // 2. Verify via parent directory listing that dirPath is actually a directory.
     //    This avoids sending a pointless GET to a path that the parent listing
     //    already knows is a file (isDir=false) or doesn't exist at all.
-    //    Root directory '/' has no parent — skip this check.
+    //    Root directory '/' (normalized = '') has no parent — skip this check.
     const normalized = normalizePath(dirPath);
     const parentPath = getParentPath(normalized);
-    if (parentPath) {
-      const parentDir = `/${parentPath}/`;
+    if (normalized) {
+      // For top-level dirs (parentPath=''), parent is root '/'.
+      // For nested dirs, parent is `/${parentPath}/`.
+      const parentDir = parentPath ? `/${parentPath}/` : '/';
       // Recursively ensure the parent directory listing is available.
       // This will fetch it from the network if it's not cached yet.
       const parentListing = await this.ensureDirListing(parentDir);

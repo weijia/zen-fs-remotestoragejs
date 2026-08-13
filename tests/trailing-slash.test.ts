@@ -22,6 +22,7 @@ describe('Trailing slash handling', () => {
     href: baseUrl,
     token: 'test-token',
     basePath: '/app_data/configs/',
+    persistCache: false,
   };
 
   beforeEach(() => {
@@ -39,6 +40,18 @@ describe('Trailing slash handling', () => {
   // Helper: setup fetch responses for common patterns
   function setupDirectoryResponse(path: string, items: string[] = []) {
     mockFetch.mockImplementation((url: string) => {
+      // Root directory listing — must include the target path as a directory entry
+      // so ensureDirListing's parent verification passes.
+      if (url === baseUrl + '/app_data/configs/') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Map([['content-type', 'application/ld+json']]),
+          json: () => Promise.resolve({
+            '@graph': [{ '@id': path + '/' }],
+          }),
+        });
+      }
       if (url.endsWith(path + '/')) {
         return Promise.resolve({
           ok: true,
@@ -207,6 +220,15 @@ describe('Trailing slash handling', () => {
   describe('rmdir', () => {
     it('reads directory with trailing slash then deletes .keep', async () => {
       mockFetch.mockImplementation((url: string) => {
+        // Root listing must include empty-dir as a directory entry
+        if (url === baseUrl + '/app_data/configs/') {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Map([['content-type', 'application/ld+json']]),
+            json: () => Promise.resolve({ '@graph': [{ '@id': 'empty-dir/' }] }),
+          });
+        }
         if (url.endsWith('/empty-dir/')) {
           return Promise.resolve({
             ok: true,

@@ -128,6 +128,8 @@ export class RemoteStorageFileSystem extends FileSystem {
   private snapshot: Map<string, string> | null = null;
   /** Root folder's ETag, used as a quick "anything changed?" check */
   private rootEtag: string | null = null;
+  /** Path probed for the sync baseline (must sit inside the token's module scope) */
+  private readonly syncRootPath: string;
   /** Whether we've already attempted to restore snapshot from IndexedDB */
   private snapshotLoaded: boolean = false;
 
@@ -164,6 +166,13 @@ export class RemoteStorageFileSystem extends FileSystem {
     if (bp && !bp.startsWith('/')) bp = '/' + bp;
     if (bp && !bp.endsWith('/')) bp = bp + '/';
     this.config = { ...config, basePath: bp };
+
+    // Sync baseline path: an authorized module root (default 'app_data/') so
+    // the shouldSync() probe stays inside the token's scope and avoids 401 on
+    // the unscoped account root. Normalize to a trailing-slash directory path.
+    let srp = config.syncRootPath ?? 'app_data/';
+    if (srp && !srp.endsWith('/')) srp = srp + '/';
+    this.syncRootPath = srp;
     
     // Set up headers
     this.headers = new Headers({
@@ -2028,14 +2037,21 @@ export class RemoteStorageFileSystem extends FileSystem {
   }
 
   /**
-   * Fetch only the root folder's ETag via a HEAD request.
+   * Fetch the sync-baseline folder's ETag via a HEAD request.
    * Returns `null` if the request fails or no ETag is present.
+   *
+   * We probe `syncRootPath` (default 'app_data/') instead of the account root,
+   * because a RemoteStorage Bearer token is scoped to the modules declared via
+   * claimAccess(); the account root (e.g. `/username/`) is NOT in any scope and
+   * returns 401. Probing an authorized module root keeps the request inside the
+   * token's scope while still serving as a reliable "did anything change?" check.
    */
   private async fetchRootEtag(): Promise<string | null> {
-    const rootUrl = this.buildUrl('/');
+    const rootUrl = this.buildUrl(this.syncRootPath);
     try {
       const response = await this.makeRequest(rootUrl, { method: 'HEAD' });
       if (!response.ok) {
+        this.logger.log('fetchRootEtag', this.syncRootPath, { status: response.status });
         return null;
       }
       return response.headers.get('ETag');
@@ -2066,7 +2082,7 @@ export class RemoteStorageFileSystem extends FileSystem {
     const rootEtag = await this.fetchRootEtag();
     this.rootEtag = rootEtag;
 
-    await this.buildSnapshotRecursive('/', previousSnapshot);
+    await this.buildSnapshotRecursive(this.syncRootPath, previousSnapshot);
 
     this.logger.logResult('buildSnapshot', '', `entries=${this.snapshot.size}`);
 

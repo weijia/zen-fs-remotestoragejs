@@ -53,6 +53,21 @@ export interface RemoteStorageConfig {
    * Defaults to `<cwd>/.zen-fs-remotestorage-cache.json`. Ignored in browsers.
    */
   cacheFile?: string;
+
+  /**
+   * Path used as the "sync baseline" when checking whether anything changed
+   * remotely (see shouldSync()). Defaults to 'app_data/'.
+   *
+   * RemoteStorage servers scope a Bearer token to the modules declared via
+   * claimAccess() (e.g. `onenav`, `app_data`). The account root (e.g.
+   * `/username/`) is NOT covered by any module scope, so a HEAD/GET on the
+   * root returns 401. Pointing this at an authorized module root (such as
+   * `app_data/`) keeps the sync-check request inside the token's scope.
+   *
+   * Set to '' to probe the account root itself (only if your token is scoped
+   * to the root, e.g. a full-access token).
+   */
+  syncRootPath?: string;
 }
 
 /**

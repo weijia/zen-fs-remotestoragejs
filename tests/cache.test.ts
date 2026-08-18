@@ -491,38 +491,61 @@ describe('ensureDirListing: parent directory verification', () => {
     fs = new RemoteStorageFileSystem({ ...noPersistConfig });
   });
 
-  it('skips fetch when parent listing says target is a file', async () => {
+  it('skips fetch when parent listing says target is a file (nested path)', async () => {
     mockFetch.mockImplementation(
       createMockFetch({
         dirs: {
-          '': [{ name: 'config.json', isDir: false }],
+          '': [{ name: 'parent', isDir: true }],
+          'parent/': [{ name: 'config.json', isDir: false }],
         },
       }),
     );
 
-    // readdir('/config.json/') — parent (root) says it's a file
-    await fs.readdir('/config.json/').catch(() => {
+    // readdir('/parent/config.json/') — parent listing says it's a file
+    await fs.readdir('/parent/config.json/').catch(() => {
       // DirectoryNotFoundError is expected
     });
 
     const getUrls = getGetUrls(mockFetch);
-    expect(getUrls).toContain(`${baseUrl}/app_data/configs/`);
-    expect(getUrls).not.toContain(`${baseUrl}/app_data/configs/config.json/`);
+    expect(getUrls).toContain(`${baseUrl}/app_data/configs/parent/`);
+    expect(getUrls).not.toContain(`${baseUrl}/app_data/configs/parent/config.json/`);
   });
 
-  it('skips fetch when target is not in parent listing', async () => {
+  it('skips fetch when target is not in parent listing (nested path)', async () => {
     mockFetch.mockImplementation(
       createMockFetch({
         dirs: {
-          '': [{ name: 'exists', isDir: true }],
+          '': [{ name: 'parent', isDir: true }],
+          'parent/': [{ name: 'exists', isDir: true }],
         },
       }),
     );
 
-    await fs.readdir('/nonexistent/').catch(() => {});
+    await fs.readdir('/parent/nonexistent/').catch(() => {});
 
     const getUrls = getGetUrls(mockFetch);
-    expect(getUrls).not.toContain(`${baseUrl}/app_data/configs/nonexistent/`);
+    expect(getUrls).not.toContain(`${baseUrl}/app_data/configs/parent/nonexistent/`);
+  });
+
+  it('top-level dirs skip parent verification — fetches directly', async () => {
+    // Top-level dirs (parentPath='') skip parent verification because the
+    // account root '/' is not accessible with a scoped Bearer token.
+    mockFetch.mockImplementation(
+      createMockFetch({
+        dirs: {
+          '': [{ name: 'subdir', isDir: true }],
+          'subdir/': [{ name: 'nested.txt', isDir: false }],
+        },
+      }),
+    );
+
+    const entries = await fs.readdir('/subdir/');
+    expect(entries).toContain('nested.txt');
+
+    const getUrls = getGetUrls(mockFetch);
+    // subdir/ is fetched directly without first fetching root listing
+    expect(getUrls).toContain(`${baseUrl}/app_data/configs/subdir/`);
+    expect(getUrls).not.toContain(`${baseUrl}/app_data/configs/`);
   });
 
   it('skips fetch when parent directory does not exist', async () => {
@@ -540,22 +563,23 @@ describe('ensureDirListing: parent directory verification', () => {
     expect(getUrls).not.toContain(`${baseUrl}/app_data/configs/foo/bar/`);
   });
 
-  it('proceeds to fetch when parent listing confirms target is a directory', async () => {
+  it('proceeds to fetch when parent listing confirms target is a directory (nested path)', async () => {
     mockFetch.mockImplementation(
       createMockFetch({
         dirs: {
-          '': [{ name: 'subdir', isDir: true }],
-          'subdir/': [{ name: 'nested.txt', isDir: false }],
+          '': [{ name: 'parent', isDir: true }],
+          'parent/': [{ name: 'subdir', isDir: true }],
+          'parent/subdir/': [{ name: 'nested.txt', isDir: false }],
         },
       }),
     );
 
-    const entries = await fs.readdir('/subdir/');
+    const entries = await fs.readdir('/parent/subdir/');
     expect(entries).toContain('nested.txt');
 
     const getUrls = getGetUrls(mockFetch);
-    expect(getUrls).toContain(`${baseUrl}/app_data/configs/`);
-    expect(getUrls).toContain(`${baseUrl}/app_data/configs/subdir/`);
+    expect(getUrls).toContain(`${baseUrl}/app_data/configs/parent/`);
+    expect(getUrls).toContain(`${baseUrl}/app_data/configs/parent/subdir/`);
   });
 
   it('root directory has no parent check — fetches directly', async () => {

@@ -167,10 +167,19 @@ export class RemoteStorageFileSystem extends FileSystem {
     if (bp && !bp.endsWith('/')) bp = bp + '/';
     this.config = { ...config, basePath: bp };
 
-    // Sync baseline path: an authorized module root (default 'app_data/') so
-    // the shouldSync() probe stays inside the token's scope and avoids 401 on
-    // the unscoped account root. Normalize to a trailing-slash directory path.
-    let srp = config.syncRootPath ?? 'app_data/';
+    // Sync baseline path: used by shouldSync() to check whether anything
+    // changed remotely via a HEAD on this path.
+    //
+    // When basePath is set (e.g. '/app_data/'), the root '/' already maps
+    // to the basePath directory via buildUrl(), so syncRootPath='/' is correct.
+    //
+    // When basePath is empty, buildUrl('/') points to the account root which
+    // is NOT covered by a scoped Bearer token and returns 401. In this case,
+    // default to 'app_data/' (an authorized module root) to stay in scope.
+    let srp = config.syncRootPath;
+    if (srp === undefined) {
+      srp = bp ? '/' : 'app_data/';
+    }
     if (srp && !srp.endsWith('/')) srp = srp + '/';
     this.syncRootPath = srp;
     
@@ -1568,6 +1577,15 @@ export class RemoteStorageFileSystem extends FileSystem {
   private async ensureDirListing(dirPath: string): Promise<Map<string, DirEntry> | null> {
     await this.ensureCacheLoaded();
 
+    // 0. If root '/' is requested but basePath is empty, redirect to
+    //    syncRootPath (e.g. 'app_data/') to avoid 401 on the account root.
+    //    When basePath is set, '/' already maps to basePath via buildUrl().
+    const normalized = normalizePath(dirPath);
+    if (!normalized && !this.config.basePath && this.syncRootPath !== '/') {
+      loggers.dir.log(`[RS-DIR] ensureDirListing('${dirPath}') → redirect to syncRootPath '${this.syncRootPath}'`);
+      return this.ensureDirListing(this.syncRootPath);
+    }
+
     // 1. Check cache first
     const cached = this.getCachedDirListing(dirPath);
     if (cached) {
@@ -1578,13 +1596,14 @@ export class RemoteStorageFileSystem extends FileSystem {
     // 2. Verify via parent directory listing that dirPath is actually a directory.
     //    This avoids sending a pointless GET to a path that the parent listing
     //    already knows is a file (isDir=false) or doesn't exist at all.
-    //    Root directory '/' (normalized = '') has no parent — skip this check.
-    const normalized = normalizePath(dirPath);
+    //    Top-level dirs (parentPath='') skip — their parent is the account
+    //    root '/', which is NOT accessible with a scoped Bearer token and would
+    //    return 401. Instead, we fetch the top-level dir directly; if it doesn't
+    //    exist, the server returns 404.
     const parentPath = getParentPath(normalized);
-    if (normalized) {
-      // For top-level dirs (parentPath=''), parent is root '/'.
-      // For nested dirs, parent is `/${parentPath}/`.
-      const parentDir = parentPath ? `/${parentPath}/` : '/';
+    if (parentPath) {
+      // Only verify parent for nested dirs (parentPath is non-empty).
+      const parentDir = `/${parentPath}/`;
       // Recursively ensure the parent directory listing is available.
       // This will fetch it from the network if it's not cached yet.
       const parentListing = await this.ensureDirListing(parentDir);

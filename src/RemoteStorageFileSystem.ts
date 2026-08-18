@@ -1240,73 +1240,99 @@ export class RemoteStorageFileSystem extends FileSystem {
    *      with a trailing '/' (covers the case where the caller passes a
    *      directory path without a slash).
    */
+  /**
+   * Get the cached ETag of a directory itself (distinct from the ETags of its
+   * children). Returns `null` if the directory isn't cached or has no ETag.
+   */
+  private getCachedDirEtag(dirPath: string): string | null {
+    const key = normalizePath(dirPath);
+    const cached = this.dirListingCache.get(key);
+    return cached ? cached.etag ?? null : null;
+  }
+
   async getRevision(path: string): Promise<string | number | undefined> {
     this.logger.log('getRevision', path);
     path = this.validateAndNormalizePath(path);
 
-    // Determine whether the path is a directory using the cached parent
-    // listing (same technique as stat() Stage 0).
-    const baseName = getBasename(path);
+    // Prefer deriving the revision from a directory listing (GET + cache),
+    // exactly like readdir()/stat() do — never send a bare HEAD probe, since
+    // many RemoteStorage servers (e.g. 5apps) respond 404 to HEAD on missing
+    // paths, which only produces console noise.
     let isDir = path === '/' || path.endsWith('/');
-    let dirCheckSource = isDir ? 'trailing-slash' : 'none';
 
-    if (!isDir && baseName) {
-      const parentPath = getParentPath(path);
-      const parentDir = parentPath ? `/${parentPath}/` : '/';
+    // 1. If this is (or might be) a directory, ensure its own listing.
+    //    A non-null result means the directory exists; use its own ETag.
+    if (isDir) {
+      const selfDir = path.endsWith('/') ? path : `${path}/`;
       try {
-        const entries = await this.ensureDirListing(parentDir);
-        this.logger.log('getRevision', path, {
-          dirCheck: 'ensureDirListing',
-          parentDir,
-          hasCache: entries !== null,
-          cacheKeys: entries ? [...entries.keys()] : null,
-        });
-        if (entries) {
-          const entry = entries.get(baseName);
-          this.logger.log('getRevision', path, {
-            dirCheck: 'parent-listing-hit',
-            baseName,
-            found: !!entry,
-            isDir: entry?.isDir,
-            etag: entry?.etag,
-          });
-          if (entry?.isDir) {
-            isDir = true;
-            dirCheckSource = 'parent-listing';
-          }
-          // If the directory listing has an ETag for this file, return it
-          // directly — no HEAD request needed.
-          if (entry?.etag) {
-            this.logger.logResult('getRevision', path, `etag=${entry.etag} (from dir listing)`);
-            return entry.etag;
-          }
-        } else {
-          this.logger.log('getRevision', path, { dirCheck: 'parent-dir-not-found' });
+        const entries = await this.ensureDirListing(selfDir);
+        if (entries === null) {
+          this.logger.logResult('getRevision', path, 'directory not found (null listing)');
+          return undefined;
         }
+        const rev = this.getCachedDirEtag(selfDir) ?? undefined;
+        this.logger.logResult('getRevision', path, rev ?? 'no-dir-etag', rev !== undefined);
+        return rev;
       } catch (err) {
-        this.logger.log('getRevision', path, { dirCheck: 'ensureDirListing-error', error: String(err) });
+        this.logger.logResult('getRevision', path, err, false);
+        return undefined;
       }
     }
 
-    const effectivePath = isDir && !path.endsWith('/') ? path + '/' : path;
-    const url = this.buildUrl(effectivePath);
-    this.logger.log('getRevision', path, {
-      isDir, dirCheckSource, effectivePath, url,
-    });
-
+    // 2. For a file, look it up in its parent listing first — no network if
+    //    the listing (and the entry's ETag) is already cached.
+    const baseName = getBasename(path);
+    const parentPath = getParentPath(path);
+    const parentDir = parentPath ? `/${parentPath}/` : '/';
     try {
-      let response = await this.makeRequest(url, { method: 'HEAD' });
-      this.logger.log('getRevision', path, { firstAttemptStatus: response.status });
-
-      // Fallback: if we got a 404 and didn't use a trailing slash, the path
-      // might still be a directory whose listing wasn't cached. Retry with '/'.
-      if (response.status === 404 && !effectivePath.endsWith('/')) {
-        const dirUrl = this.buildUrl(effectivePath + '/');
-        this.logger.log('getRevision', path, { retryingWithTrailingSlash: true, dirUrl });
-        response = await this.makeRequest(dirUrl, { method: 'HEAD' });
-        this.logger.log('getRevision', path, { retryStatus: response.status });
+      const entries = await this.ensureDirListing(parentDir);
+      this.logger.log('getRevision', path, {
+        dirCheck: 'ensureDirListing',
+        parentDir,
+        hasCache: entries !== null,
+        cacheKeys: entries ? [...entries.keys()] : null,
+      });
+      if (entries) {
+        const entry = entries.get(baseName);
+        this.logger.log('getRevision', path, {
+          dirCheck: 'parent-listing-hit',
+          baseName,
+          found: !!entry,
+          isDir: entry?.isDir,
+          etag: entry?.etag,
+        });
+        if (!entry) {
+          // Parent listing exists but doesn't contain this entry — file is gone.
+          this.logger.logResult('getRevision', path, 'not in parent listing');
+          return undefined;
+        }
+        if (entry.isDir) {
+          // It's actually a directory — return its own ETag, no HEAD.
+          isDir = true;
+          const rev = this.getCachedDirEtag(`${parentDir}${baseName}/`) ?? undefined;
+          this.logger.logResult('getRevision', path, rev ?? 'no-dir-etag', rev !== undefined);
+          return rev;
+        }
+        if (entry.etag) {
+          this.logger.logResult('getRevision', path, `etag=${entry.etag} (from dir listing)`);
+          return entry.etag;
+        }
+        // Entry present but without an ETag — fall through to HEAD below.
+      } else {
+        this.logger.log('getRevision', path, { dirCheck: 'parent-dir-not-found' });
       }
+    } catch (err) {
+      this.logger.log('getRevision', path, { dirCheck: 'ensureDirListing-error', error: String(err) });
+    }
 
+    // 3. Last resort: a single HEAD to fetch the revision for a file whose ETag
+    //    wasn't available from the directory listing. (HEAD is only used here,
+    //    for files, and only when necessary.)
+    const url = this.buildUrl(path);
+    this.logger.log('getRevision', path, { fallback: 'HEAD', url });
+    try {
+      const response = await this.makeRequest(url, { method: 'HEAD' });
+      this.logger.log('getRevision', path, { headStatus: response.status });
       if (!response.ok) {
         this.logger.logResult('getRevision', path, `status=${response.status}`);
         return undefined;

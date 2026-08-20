@@ -1501,11 +1501,18 @@ export class RemoteStorageFileSystem extends FileSystem {
   private getCachedDirListing(dirPath: string): Map<string, DirEntry> | null {
     const key = normalizePath(dirPath);
     const cached = this.dirListingCache.get(key);
-    if (!cached) return null;
-    if (Date.now() - cached.ts >= RemoteStorageFileSystem.DIR_LISTING_TTL) {
+    if (!cached) {
+      loggers.dir.log(`[RS-TTL] getCachedDirListing(${dirPath}) key=${key}: CACHE MISS (no entry)`);
+      return null;
+    }
+    const age = Date.now() - cached.ts;
+    const ttl = RemoteStorageFileSystem.DIR_LISTING_TTL;
+    if (age >= ttl) {
+      loggers.dir.log(`[RS-TTL] getCachedDirListing(${dirPath}) key=${key}: EXPIRED (age=${age}ms >= TTL=${ttl}ms, ts=${cached.ts}, now=${Date.now()}) → deleting cache entry, will trigger network fetch`);
       this.dirListingCache.delete(key); // long-TTL fallback expiry
       return null;
     }
+    loggers.dir.log(`[RS-TTL] getCachedDirListing(${dirPath}) key=${key}: FRESH (age=${age}ms < TTL=${ttl}ms, ts=${cached.ts}, now=${Date.now()}) → returning ${cached.entries.size} entries`);
     return cached.entries;
   }
 
@@ -1610,12 +1617,18 @@ export class RemoteStorageFileSystem extends FileSystem {
     //    ensureDirectoryPath() adds trailing slash so buildUrl() generates a directory URL
     //    (RemoteStorage requires directory URLs to end with '/')
     const dirUrl = this.buildUrl(ensureDirectoryPath(normalized));
-    loggers.dir.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: cache MISS, fetching ${dirUrl}`);
+    // Check if we had a previous ETag for this directory (from the deleted/expired cache entry)
+    // This helps understand whether a conditional request could have been used.
+    const previousEtag = this.getCachedDirEtag(normalized);
+    loggers.dir.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: CACHE MISS (expired or not cached), fetching ${dirUrl} — previousEtag=${previousEtag ?? 'null'}`);
+    loggers.sync.log(`[RS-SYNC] ensureDirListing NETWORK REQUEST: ${dirUrl} (dirPath=${dirPath}, previousEtag=${previousEtag ?? 'null'})`);
 
     const response = await this.makeRequest(dirUrl, {
       method: 'GET',
       headers: { 'Accept': 'application/ld+json' },
     });
+
+    loggers.dir.log(`[RS-DIR] ensureDirListing(${dirPath}) backend=${this.backendName}: network response status=${response.status} etag=${response.headers.get('ETag') ?? 'null'}`);
 
     if (!response.ok) {
       if (response.status === 404) {
@@ -1987,16 +2000,21 @@ export class RemoteStorageFileSystem extends FileSystem {
    * skipping the expensive full tree walk.
    */
   async shouldSync(): Promise<boolean> {
+    loggers.sync.log(`[RS-SYNC] shouldSync() called (snapshot=${this.snapshot === null ? 'null' : `${this.snapshot.size} entries`}, rootEtag=${this.rootEtag ?? 'null'})`);
     this.logger.log('shouldSync', '(snapshot check)');
 
     // First call — try restoring from IndexedDB before building from scratch
     if (this.snapshot === null) {
       // Attempt to restore snapshot from IndexedDB
       await this.loadSnapshotFromIDB();
+      const snap = this.snapshot as Map<string, string> | null;
+      loggers.sync.log(`[RS-SYNC] shouldSync: after IDB restore → snapshot=${snap === null ? 'null' : `${snap.size} entries`}, rootEtag=${this.rootEtag ?? 'null'}`);
 
       if (this.snapshot !== null && this.rootEtag !== null) {
         // Snapshot restored — check if root ETag is still the same
+        loggers.sync.log(`[RS-SYNC] shouldSync: snapshot restored, fetching current root ETag to compare with stored rootEtag='${this.rootEtag}'`);
         const currentRootEtag = await this.fetchRootEtag();
+        loggers.sync.log(`[RS-SYNC] shouldSync: currentRootEtag='${currentRootEtag ?? 'null'}' vs stored rootEtag='${this.rootEtag}' → ${currentRootEtag === this.rootEtag ? 'SAME (no sync)' : 'DIFFERENT (will sync)'}`);
         if (currentRootEtag !== null && currentRootEtag === this.rootEtag) {
           this.logger.logResult('shouldSync', '', 'false (snapshot restored from IDB, root ETag unchanged)');
           return false;
@@ -2008,25 +2026,30 @@ export class RemoteStorageFileSystem extends FileSystem {
       }
 
       // No persisted snapshot — build one from scratch and signal full sync
+      loggers.sync.log(`[RS-SYNC] shouldSync: no persisted snapshot, building from scratch`);
       await this.buildSnapshot();
       this.logger.logResult('shouldSync', '', 'true (first call, baseline built)');
       return true;
     }
 
     // Quick check: GET root folder listing and compare ETag
+    loggers.sync.log(`[RS-SYNC] shouldSync: existing snapshot (${this.snapshot.size} entries), fetching current root ETag...`);
     const currentRootEtag = await this.fetchRootEtag();
     if (currentRootEtag === null) {
       // Couldn't fetch root ETag — err on the side of syncing
+      loggers.sync.log(`[RS-SYNC] shouldSync: currentRootEtag=null (unavailable) → returning true (sync)`);
       this.logger.logResult('shouldSync', '', 'true (root ETag unavailable)');
       return true;
     }
 
+    loggers.sync.log(`[RS-SYNC] shouldSync: currentRootEtag='${currentRootEtag}' vs stored rootEtag='${this.rootEtag}' → ${currentRootEtag === this.rootEtag ? 'SAME (no sync)' : 'DIFFERENT (will sync)'}`);
     if (currentRootEtag === this.rootEtag) {
       this.logger.logResult('shouldSync', '', 'false (root ETag unchanged)');
       return false;
     }
 
     // Root ETag changed — rebuild snapshot (with subtree pruning) and sync
+    loggers.sync.log(`[RS-SYNC] shouldSync: root ETag changed, rebuilding snapshot...`);
     await this.buildSnapshot();
     this.logger.logResult('shouldSync', '', 'true (root ETag changed)');
     return true;
@@ -2046,10 +2069,31 @@ export class RemoteStorageFileSystem extends FileSystem {
     // Reuse ensureDirListing so we only ever issue a GET (not HEAD, which is
     // not reliably supported by RemoteStorage servers). ensureDirListing
     // caches the directory list and its own ETag, which we return here.
+    loggers.sync.log(`[RS-SYNC] fetchRootEtag() called for syncRootPath='${this.syncRootPath}'`);
+    // Check cache state BEFORE calling ensureDirListing, so we can see whether
+    // the ETag will come from cache or from a fresh network request.
+    const cacheKey = normalizePath(this.syncRootPath);
+    const preCached = this.dirListingCache.get(cacheKey);
+    if (preCached) {
+      const age = Date.now() - preCached.ts;
+      const expired = age >= RemoteStorageFileSystem.DIR_LISTING_TTL;
+      loggers.sync.log(`[RS-SYNC] fetchRootEtag: cache BEFORE ensureDirListing → key=${cacheKey} age=${age}ms TTL=${RemoteStorageFileSystem.DIR_LISTING_TTL}ms expired=${expired} etag=${preCached.etag ?? 'null'}`);
+    } else {
+      loggers.sync.log(`[RS-SYNC] fetchRootEtag: cache BEFORE ensureDirListing → key=${cacheKey} NOT IN CACHE (will trigger network fetch)`);
+    }
     try {
       await this.ensureDirListing(this.syncRootPath);
-      return this.getCachedDirEtag(this.syncRootPath);
+      const etag = this.getCachedDirEtag(this.syncRootPath);
+      // Check if the cache was refreshed (new ts) to determine if a network request was made
+      const postCached = this.dirListingCache.get(cacheKey);
+      if (postCached && preCached) {
+        const wasRefreshed = postCached.ts !== preCached.ts;
+        loggers.sync.log(`[RS-SYNC] fetchRootEtag: cache AFTER ensureDirListing → ts_changed=${wasRefreshed} (pre=${preCached.ts} post=${postCached.ts}) → ${wasRefreshed ? 'NETWORK FETCH occurred' : 'CACHE HIT (no network request)'}`);
+      }
+      loggers.sync.log(`[RS-SYNC] fetchRootEtag: returning etag=${etag ?? 'null'}`);
+      return etag;
     } catch (e) {
+      loggers.sync.log(`[RS-SYNC] fetchRootEtag: FAILED: ${e}`);
       this.logger.log('fetchRootEtag', this.syncRootPath, { error: String(e) });
       return null;
     }

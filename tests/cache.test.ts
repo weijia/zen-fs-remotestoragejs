@@ -366,7 +366,7 @@ describe('dirListingCache: ts refresh on restore', () => {
     expect(fetchCount).toBe(0);
   });
 
-  it('restored entries with old ts still work (ts refresh prevents immediate expiry)', async () => {
+  it('restored entries with old ts are expired and re-fetched (ts preserved, not refreshed)', async () => {
     // Manually write a cache file with an old timestamp to simulate
     // a cache that was persisted 10 minutes ago (past TTL).
     const oldTs = Date.now() - 10 * 60_000; // 10 minutes ago
@@ -400,10 +400,9 @@ describe('dirListingCache: ts refresh on restore', () => {
     await new Promise((r) => setTimeout(r, 100));
     await fs.readdir('/');
 
-    // Without ts refresh, the entry (age=10min > TTL=5min) would be expired
-    // and deleted on access → MISS → fetch from network.
-    // With ts refresh, the entry gets a fresh TTL window → HIT → no fetch.
-    expect(fetchCount).toBe(0);
+    // With ts preserved, the entry (age=10min > TTL=5min) is expired
+    // → MISS → fetch from network to check for updates.
+    expect(fetchCount).toBe(1);
   });
 });
 

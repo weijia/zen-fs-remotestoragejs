@@ -1756,13 +1756,14 @@ export class RemoteStorageFileSystem extends FileSystem {
               for (const [name, e] of Object.entries(v.entries)) {
                 m.set(name, e);
               }
-              // Refresh ts to now so restored entries get a fresh TTL window.
-              // The original ts is preserved as originalTs for age logging.
-              // The ETag (if present) will be used for conditional validation
-              // on the next fetch, so we don't lose staleness detection.
-              this.dirListingCache.set(k, { etag: v.etag, ts: now, entries: m });
+              // Preserve original ts so expired cache entries are naturally
+              // re-fetched on next access. If the original ts is older than
+              // DIR_LISTING_TTL, getCachedDirListing will return null and
+              // ensureDirListing will issue a conditional request (with ETag)
+              // to check for updates.
+              this.dirListingCache.set(k, { etag: v.etag, ts: v.ts, entries: m });
               const age = now - v.ts;
-              loggers.cache.log(`[RS-CACHE-LOAD]   restored dir[${k}]: ${m.size} entries=[${[...m.keys()].join(',')}] originalAge=${age}ms (ts refreshed to now) etag=${v.etag ?? 'null'}`);
+              loggers.cache.log(`[RS-CACHE-LOAD]   restored dir[${k}]: ${m.size} entries=[${[...m.keys()].join(',')}] originalAge=${age}ms (ts preserved) etag=${v.etag ?? 'null'}`);
             }
             this.logger.logResult('cache', 'load', `restored ${this.dirListingCache.size} dirs`);
             loggers.cache.log(`[RS-CACHE-LOAD] backend=${this.backendName} total ${this.dirListingCache.size} dirs restored`);

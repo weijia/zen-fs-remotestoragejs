@@ -73,7 +73,7 @@ export class RemoteStorageFileSystem extends FileSystem {
   private readonly logger: ReturnType<typeof createLogger>;
 
   /**
-   * Existence cache to avoid repeated HEAD/GET requests for the same path.
+   * Existence cache to avoid repeated GET requests for the same path.
    * - `true`  = confirmed to exist (valid until invalidated by mutations)
    * - `false` = confirmed missing (with TTL to allow re-checking after writes)
    * - `undefined` = unknown, needs network check
@@ -85,7 +85,7 @@ export class RemoteStorageFileSystem extends FileSystem {
   /**
    * Directory listing cache — caches readdir() results (with per-entry
    * metadata: isDir, etag, size, lastModified) so that stat() can return
-   * without a HEAD request, and multiple stat() calls in a directory share
+   * without a network request, and multiple stat() calls in a directory share
    * one network request.
    *
    * Invalidation is ETag-based (precise): a directory entry is refreshed only
@@ -106,16 +106,6 @@ export class RemoteStorageFileSystem extends FileSystem {
     size: 0,
     lastModified: undefined,
   };
-
-  /**
-   * Whether HEAD is supported by this server.
-   * - `null`  = unknown, will probe on first stat()
-   * - `false` = server returned 405 or similar, skip HEAD in future calls
-   * - `true`  = HEAD works, use it as the fast path
-   *
-   * This avoids wasting a request on servers that don't support HEAD.
-   */
-  private headSupported: boolean | null = null;
 
   // --- Precise mtime ---
   /** Whether to use .mtime sidecar files for precise mtime. Default: true */
@@ -991,9 +981,9 @@ export class RemoteStorageFileSystem extends FileSystem {
     loggers.stat.log(`[RS-STAT]   cache state: ${this.dumpCacheState(path)}`);
 
     // ---- Stage 0: Existence check via directory listing ----
-    // Before any HEAD/GET, check the cached (or freshly fetched) parent
+    // Before any GET, check the cached (or freshly fetched) parent
     // directory listing. If the file isn't there, it doesn't exist —
-    // no need to waste a HEAD request.
+    // no need to waste a network request.
     let existsViaDir = false;
     let isDirViaDir = false;
     let dirListingAvailable = false;
@@ -1028,8 +1018,8 @@ export class RemoteStorageFileSystem extends FileSystem {
     //
     // Trust the listing up to DIR_LISTING_TTL (5 min). If the listing is
     // still within its TTL, a "not in listing" result means the file
-    // genuinely doesn't exist — no HEAD probe needed. Only when the listing
-    // has fully expired do we fall through to HEAD verification.
+    // genuinely doesn't exist — no file GET needed. Only when the listing
+    // has fully expired do we fall through to a file GET verification.
     if (dirListingAvailable && !existsViaDir && !callerSaysDir) {
       const parentPath = getParentPath(path);
       const parentDir = parentPath ? `/${parentPath}/` : '/';
@@ -1040,81 +1030,66 @@ export class RemoteStorageFileSystem extends FileSystem {
         throw new FileNotFoundError(path);
       }
       // Listing is stale — file might have been created externally.
-      // Fall through to HEAD probe to verify.
-      loggers.stat.log(`[RS-STAT] stat(${path}): not in STALE dir listing (age=${listingAge}ms >= ${RemoteStorageFileSystem.POSITIVE_CACHE_TTL}ms), falling through to HEAD probe`);
+      // Fall through to a file GET probe in Stage 2 to verify.
+      loggers.stat.log(`[RS-STAT] stat(${path}): not in STALE dir listing (age=${listingAge}ms >= ${RemoteStorageFileSystem.POSITIVE_CACHE_TTL}ms), falling through to file GET probe`);
     }
 
     // If the caller explicitly passes a trailing slash, they already know
     // it's a directory — skip the file probe entirely.
-    // Try HEAD when:
-    //   (a) dir listing wasn't available (parent unreadable) — HEAD as fallback
-    //   (b) dir listing was available but STALE and file not in it — verify
-    //       with server before declaring not-found (prevents cache inconsistency)
     //
-    // NOTE: When the file IS in the dir listing but the entry lacks `size`,
-    // we do NOT send HEAD just for metadata. Stage 2 returns stat with
-    // `size: 0` — acceptable for sync which keys on mtime, not size.
-    const needMetadata = !cachedEntry;
-    const shouldTryHead = !callerSaysDir && this.headSupported !== false
-      && !isDirViaDir && needMetadata;
-    loggers.stat.log(`[RS-STAT] stat(${path}): shouldTryHead=${shouldTryHead} (callerSaysDir=${callerSaysDir} headSupported=${this.headSupported} isDirViaDir=${isDirViaDir} needMetadata=${needMetadata})`);
-    if (shouldTryHead) {
-      // ---- Stage 1: HEAD probe (metadata / existence verification) ----
-      // Fetch metadata via HEAD. This also serves as an existence check
-      // when the dir listing was stale and the file wasn't in it.
-      const fileUrl = this.buildUrl(path);
-      loggers.stat.log(`[RS-STAT] stat(${path}): sending HEAD ${fileUrl}`);
-      try {
-        const response = await this.makeRequest(fileUrl, { method: 'HEAD' });
-        loggers.stat.log(`[RS-STAT] stat(${path}): HEAD response status=${response.status}`);
-        if (response.ok) {
-          this.headSupported = true;
-          const contentType = response.headers.get('content-type') || '';
-          if (!contentType.includes('application/ld+json') && !contentType.includes('text/html')) {
-            const contentLength = response.headers.get('content-length');
-            const lastModified = response.headers.get('last-modified');
-            const size = contentLength ? parseInt(contentLength, 10) : 0;
-            let mtime = lastModified ? new Date(lastModified).getTime() : Date.now();
+    // We never use HEAD: RemoteStorage servers are not required to support
+    // it. Instead, everything is resolved via GET — either from the cached
+    // directory listing (preferred) or a trailing-slash GET directory probe
+    // (Stage 2). When the listing is stale and the file isn't in it, we fall
+    // through to a GET of the file itself (see below) rather than HEAD.
 
-            if (this.usePreciseMtime) {
-              const preciseMtime = await this.readMtimeSidecar(path);
-              if (preciseMtime !== undefined) {
-                mtime = preciseMtime;
+    // ---- Stage 2: Return stat from directory listing, file GET, or dir probe ----
+    //
+    // When the dir listing was stale and the file wasn't found in it, probe
+    // the file directly via GET (NOT HEAD). This reliably detects a file
+    // that was created externally after our cached listing went stale.
+    if (dirListingAvailable && !existsViaDir && !callerSaysDir) {
+      const listingAge = this.getDirListingAge(
+        getParentPath(path) ? `/${getParentPath(path)}/` : '/',
+      );
+      const stale = listingAge === null || listingAge >= RemoteStorageFileSystem.DIR_LISTING_TTL;
+      if (stale) {
+        loggers.stat.log(`[RS-STAT] stat(${path}): stale listing — probing file via GET ${this.buildUrl(path)}`);
+        try {
+          const fileResp = await this.makeRequest(this.buildUrl(path), { method: 'GET' });
+          if (fileResp.ok) {
+            const contentType = fileResp.headers.get('content-type') || '';
+            // A directory URL with trailing slash returns JSON-LD/HTML; a real
+            // file returns other content types — treat non-dir as a file hit.
+            if (!contentType.includes('application/ld+json') && !contentType.includes('text/html')) {
+              const contentLength = fileResp.headers.get('content-length');
+              const lastModified = fileResp.headers.get('last-modified');
+              const size = contentLength ? parseInt(contentLength, 10) : 0;
+              let mtime = lastModified ? new Date(lastModified).getTime() : Date.now();
+              if (this.usePreciseMtime) {
+                const preciseMtime = await this.readMtimeSidecar(path);
+                if (preciseMtime !== undefined) mtime = preciseMtime;
               }
+              loggers.stat.log(`[RS-STAT] stat(${path}): returning via file GET (size=${size}), setting existenceCache=true`);
+              this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
+              return { ino: 0, mode: 0o100644, uid: 0, gid: 0, size,
+                mtimeMs: mtime, ctimeMs: mtime, atimeMs: mtime, birthtimeMs: mtime, nlink: 1 };
             }
-
-            const result = {
-              ino: 0, mode: 0o100644, uid: 0, gid: 0,
-              size, mtimeMs: mtime, ctimeMs: mtime, atimeMs: mtime, birthtimeMs: mtime, nlink: 1,
-            };
-            this.logger.logResult('stat', path, `FILE mode=${result.mode.toString(8)} size=${size}`);
-            loggers.stat.log(`[RS-STAT] stat(${path}): returning via HEAD OK (size=${size}), setting existenceCache=true`);
-            this.existenceCache.set(normalizePath(path), { exists: true, ts: Date.now() });
-            return result;
+          } else if (fileResp.status === 401 || fileResp.status === 403) {
+            this.handleHttpError(fileResp, path, 'stat');
+          } else if (fileResp.status === 404) {
+            loggers.stat.log(`[RS-STAT] stat(${path}): file GET 404 — confirmed not found, setting existenceCache=false`);
+            this.existenceCache.set(normalizePath(path), { exists: false, ts: Date.now() });
+            throw new FileNotFoundError(path);
           }
+        } catch (error) {
+          if (error instanceof AuthenticationError || error instanceof PermissionDeniedError) throw error;
+          if (error instanceof FileNotFoundError) throw error;
+          // network/other error → fall through to dir probe below
         }
-        if (response.status === 405) {
-          this.headSupported = false;
-          this.logger.log('stat', path, { headStatus: 405, cachedAsUnsupported: true });
-        } else if (response.status === 401 || response.status === 403) {
-          this.handleHttpError(response, path, 'stat');
-        } else if (response.status === 404) {
-          // HEAD 404 = file confirmed not to exist. Set negative existence
-          // cache so subsequent exists() calls can skip the HEAD probe.
-          loggers.stat.log(`[RS-STAT] stat(${path}): HEAD 404 — file confirmed not found, setting existenceCache=false`);
-          this.existenceCache.set(normalizePath(path), { exists: false, ts: Date.now() });
-        }
-        this.logger.log('stat', path, { headStatus: response.status, fallingThrough: 'readdir stat' });
-        loggers.stat.log(`[RS-STAT] stat(${path}): HEAD status=${response.status}, falling through to stage 2`);
-      } catch (error) {
-        if (error instanceof AuthenticationError || error instanceof PermissionDeniedError) {
-          throw error;
-        }
-        this.logger.log('stat', path, { headError: error instanceof Error ? error.message : String(error), fallingThrough: 'readdir stat' });
       }
     }
 
-    // ---- Stage 2: Return stat from directory listing or directory probe ----
 
     // File confirmed as directory via listing
     if (existsViaDir && isDirViaDir) {
@@ -1127,7 +1102,7 @@ export class RemoteStorageFileSystem extends FileSystem {
 
     // File confirmed as regular file via listing. Prefer metadata from the
     // cached directory entry (size / Last-Modified) so we can return without a
-    // HEAD request. Fall back to a HEAD probe when metadata is missing.
+    // network request. The file GET in Stage 2 covers missing-metadata cases.
     if (existsViaDir && !isDirViaDir) {
       const size = cachedEntry?.size ?? 0;
       let mtime = cachedEntry?.lastModified
@@ -1250,7 +1225,7 @@ export class RemoteStorageFileSystem extends FileSystem {
    * fallback for `readFile`. Prefers the `ETag`, falling back to
    * `Last-Modified` (HTTP-date string).
    *
-   * RemoteStorage servers require a trailing '/' for directory URLs; a HEAD
+   * RemoteStorage servers require a trailing '/' for directory URLs; a GET
    * on a directory path without the slash returns 404.  To avoid this we:
    *   1. Check the cached parent-dir listing — if it says the path is a
    *      directory, append '/' before building the URL.
@@ -1343,14 +1318,15 @@ export class RemoteStorageFileSystem extends FileSystem {
       this.logger.log('getRevision', path, { dirCheck: 'ensureDirListing-error', error: String(err) });
     }
 
-    // 3. Last resort: a single HEAD to fetch the revision for a file whose ETag
-    //    wasn't available from the directory listing. (HEAD is only used here,
-    //    for files, and only when necessary.)
+    // 3. Last resort: GET the file to fetch its ETag when the directory
+    //    listing didn't carry one. We use GET (not HEAD — RemoteStorage
+    //    servers aren't required to support HEAD) and read only the response
+    //    headers; the body is discarded. A 404 means the file is gone.
     const url = this.buildUrl(path);
-    this.logger.log('getRevision', path, { fallback: 'HEAD', url });
+    this.logger.log('getRevision', path, { fallback: 'GET', url });
     try {
-      const response = await this.makeRequest(url, { method: 'HEAD' });
-      this.logger.log('getRevision', path, { headStatus: response.status });
+      const response = await this.makeRequest(url, { method: 'GET' });
+      this.logger.log('getRevision', path, { getStatus: response.status });
       if (!response.ok) {
         this.logger.logResult('getRevision', path, `status=${response.status}`);
         return undefined;
@@ -1536,7 +1512,7 @@ export class RemoteStorageFileSystem extends FileSystem {
   /**
    * Get the age (in ms) of a cached directory listing, or `null` if the
    * directory is not cached / expired. Used by `stat()` to decide whether
-   * a "file not in listing" result is trustworthy or needs a HEAD probe.
+   * a "file not in listing" result is trustworthy or needs a file GET probe.
    */
   private getDirListingAge(dirPath: string): number | null {
     const key = normalizePath(dirPath);
@@ -2037,7 +2013,7 @@ export class RemoteStorageFileSystem extends FileSystem {
       return true;
     }
 
-    // Quick check: HEAD root folder and compare ETag
+    // Quick check: GET root folder listing and compare ETag
     const currentRootEtag = await this.fetchRootEtag();
     if (currentRootEtag === null) {
       // Couldn't fetch root ETag — err on the side of syncing
@@ -2057,7 +2033,7 @@ export class RemoteStorageFileSystem extends FileSystem {
   }
 
   /**
-   * Fetch the sync-baseline folder's ETag via a HEAD request.
+   * Fetch the sync-baseline folder's ETag via a GET request.
    * Returns `null` if the request fails or no ETag is present.
    *
    * We probe `syncRootPath` (default 'app_data/') instead of the account root,
@@ -2067,15 +2043,14 @@ export class RemoteStorageFileSystem extends FileSystem {
    * token's scope while still serving as a reliable "did anything change?" check.
    */
   private async fetchRootEtag(): Promise<string | null> {
-    const rootUrl = this.buildUrl(this.syncRootPath);
+    // Reuse ensureDirListing so we only ever issue a GET (not HEAD, which is
+    // not reliably supported by RemoteStorage servers). ensureDirListing
+    // caches the directory list and its own ETag, which we return here.
     try {
-      const response = await this.makeRequest(rootUrl, { method: 'HEAD' });
-      if (!response.ok) {
-        this.logger.log('fetchRootEtag', this.syncRootPath, { status: response.status });
-        return null;
-      }
-      return response.headers.get('ETag');
-    } catch {
+      await this.ensureDirListing(this.syncRootPath);
+      return this.getCachedDirEtag(this.syncRootPath);
+    } catch (e) {
+      this.logger.log('fetchRootEtag', this.syncRootPath, { error: String(e) });
       return null;
     }
   }

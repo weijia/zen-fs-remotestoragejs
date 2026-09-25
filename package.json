@@ -8,11 +8,13 @@
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
+      "browser": "./dist/zen-fs-remotestoragejs.global.js",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
     }
   },
+  "browser": "./dist/zen-fs-remotestoragejs.global.js",
   "files": [
     "dist",
     "README.md",
@@ -20,6 +22,7 @@
   ],
   "scripts": {
     "build": "tsup",
+    "build:iife": "tsup --config tsup.config.ts",
     "dev": "tsup --watch",
     "test": "vitest",
     "test:ui": "vitest --ui",

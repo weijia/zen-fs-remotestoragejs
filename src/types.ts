@@ -54,20 +54,6 @@ export interface RemoteStorageConfig {
    */
   cacheFile?: string;
 
-  /**
-   * Path used as the "sync baseline" when checking whether anything changed
-   * remotely (see shouldSync()).
-   *
-   * Defaults to '/' when basePath is set (root maps to basePath via buildUrl),
-   * or 'app_data/' when basePath is empty (to avoid 401 on the account root).
-   *
-   * RemoteStorage servers scope a Bearer token to the modules declared via
-   * claimAccess() (e.g. `onenav`, `app_data`). The account root (e.g.
-   * `/username/`) is NOT covered by any module scope, so a HEAD/GET on the
-   * root returns 401. When basePath is empty, the default 'app_data/' keeps
-   * the sync-check request inside the token's scope.
-   */
-  syncRootPath?: string;
 }
 
 /**

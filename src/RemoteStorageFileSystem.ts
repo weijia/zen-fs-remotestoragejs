@@ -157,21 +157,14 @@ export class RemoteStorageFileSystem extends FileSystem {
     if (bp && !bp.endsWith('/')) bp = bp + '/';
     this.config = { ...config, basePath: bp };
 
-    // Sync baseline path: used by shouldSync() to check whether anything
-    // changed remotely via a HEAD on this path.
-    //
-    // When basePath is set (e.g. '/app_data/'), the root '/' already maps
-    // to the basePath directory via buildUrl(), so syncRootPath='/' is correct.
-    //
-    // When basePath is empty, buildUrl('/') points to the account root which
-    // is NOT covered by a scoped Bearer token and returns 401. In this case,
-    // default to 'app_data/' (an authorized module root) to stay in scope.
-    let srp = config.syncRootPath;
-    if (srp === undefined) {
-      srp = bp ? '/' : 'app_data/';
-    }
-    if (srp && !srp.endsWith('/')) srp = srp + '/';
-    this.syncRootPath = srp;
+    // Sync baseline path (syncRootPath): the root probed by shouldSync() /
+    // buildSnapshot() to detect remote changes. It is now derived internally
+    // and is no longer a public config option:
+    //   - basePath set   → '/'        (buildUrl('/') already maps to the basePath dir)
+    //   - basePath empty → 'app_data/' (the account root is NOT covered by the
+    //     scoped Bearer token and returns 401; 'app_data/' stays in scope)
+    const srp = bp ? '/' : 'app_data/';
+    this.syncRootPath = srp.endsWith('/') ? srp : srp + '/';
     
     // Set up headers
     this.headers = new Headers({

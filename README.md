@@ -99,13 +99,12 @@ pair.watch();
 |--------|------|---------|-------------|
 | `href` | `string` | **required** | Base URL of the RemoteStorage server |
 | `token` | `string` | **required** | Bearer token for authentication |
-| `basePath` | `string` | `undefined` | Base path prefix for all file operations (e.g. `'/public/'`, `'/username/app_data/'`) |
+| `basePath` | `string` | `undefined` | Base path prefix for all file operations (e.g. `'/public/'`, `'/username/app_data/'`); the sync baseline is derived from it (root when set, `app_data/` when empty) |
 | `headers` | `Record<string, string>` | `undefined` | Extra HTTP headers to include in every request |
 | `timeout` | `number` | `30000` | Request timeout in milliseconds |
 | `preciseMtime` | `boolean` | `true` | Enable millisecond-precision mtime via `.mtime` sidecar files |
 | `persistCache` | `boolean` | `true` | Persist directory listing cache to localStorage (browser) or file (Node.js) |
 | `cacheFile` | `string` | `.zen-fs-remotestorage-cache.json` | Path for persisted cache file (Node.js only) |
-| `syncRootPath` | `string` | `'/'` or `'app_data/'` | Path used as the sync baseline for `shouldSync()` |
 
 ## How Caching Works
 

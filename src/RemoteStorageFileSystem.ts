@@ -1840,7 +1840,11 @@ export class RemoteStorageFileSystem extends FileSystem {
    * (filtered from readdir, excluded from sync).
    */
   private async writeMtimeSidecar(filePath: string, mtime: number): Promise<void> {
-    const sidecarPath = mtimePathFor(filePath);
+  	// Never nest sidecars: if `filePath` is itself a .mtime sidecar, do nothing
+  	// (otherwise we'd create `.file.mtime.mtime`). This happens when a sidecar
+  	// file is legitimately synced as a regular file to another backend.
+  	if (isMtimeSidecar(getBasename(filePath))) return;
+  	const sidecarPath = mtimePathFor(filePath);
     const sidecarUrl = this.buildUrl(sidecarPath);
     const body = JSON.stringify({ mtime });
     try {

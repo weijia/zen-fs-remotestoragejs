@@ -264,7 +264,56 @@ describe('Precise mtime (.mtime sidecar)', () => {
     expect(entries).toContain('data.json');
     expect(entries).not.toContain('.config.json.mtime');
     expect(entries).not.toContain('.data.json.mtime');
-  });
+    });
+
+    it('readdir also filters nested (.mtime.mtime) and dotfile-data (.group-type.mtime) sidecars', async () => {
+    	// 日志里出现过的真实泄漏形态：嵌套 sidecar 与 dotfile 数据文件的 sidecar
+    	// 都必须从 readdir 结果中隐藏，否则 walkFiles 会把它们当普通文件同步。
+    	mockFetch.mockImplementation((url: string) => {
+    		if (url === baseUrl + '/app_data/') {
+    			return Promise.resolve({
+    				ok: true,
+    				status: 200,
+    				headers: new Map([['content-type', 'application/ld+json']]),
+    				json: () => Promise.resolve({
+    					'@graph': [
+    						{ '@id': 'config.json' },
+    						{ '@id': '.config.json.mtime' },
+    						{ '@id': '.config.json.mtime.mtime' },
+    						{ '@id': '.group-type.mtime' },
+    						{ '@id': '.group-type.mtime.mtime' },
+    						{ '@id': 'data.json' },
+    					],
+    				}),
+    			});
+    		}
+    		return Promise.resolve({ ok: false, status: 404, headers: new Map() });
+    	});
+
+    	const entries = await fs.readdir('/');
+    	expect(entries).toContain('config.json');
+    	expect(entries).toContain('data.json');
+    	expect(entries).not.toContain('.config.json.mtime');
+    	expect(entries).not.toContain('.config.json.mtime.mtime');
+    	expect(entries).not.toContain('.group-type.mtime');
+    	expect(entries).not.toContain('.group-type.mtime.mtime');
+    	});
+
+    	it('writeFile on a .mtime sidecar path does NOT create a nested .mtime.mtime', async () => {
+    		const capturedUrls: string[] = [];
+    		mockFetch.mockImplementation((url: string) => {
+    			capturedUrls.push(url);
+    			return Promise.resolve({ ok: true, status: 200, headers: new Map() });
+    		});
+
+    		// If a `.mtime` sidecar is ever written as a regular file (e.g. a
+    		// sidecar leaking in from another backend), writeMtimeSidecar's
+    		// never-nest guard must prevent `.file.mtime.mtime`.
+    		await fs.writeFile('/.config.json.mtime', '{"mtime":123}');
+
+    		expect(capturedUrls).toContain(baseUrl + '/app_data/.config.json.mtime');
+    		expect(capturedUrls).not.toContain(baseUrl + '/app_data/.config.json.mtime.mtime');
+    	});
 
   it('unlink deletes .mtime sidecar', async () => {
     const deletedUrls: string[] = [];

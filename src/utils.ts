@@ -174,24 +174,41 @@ export function joinPath(...segments: string[]): string {
 /**
  * Compute the .mtime sidecar path for a given file path.
  *
- * /documents/note.json → /documents/.note.json.mtime
- * /config.json         → /.config.json.mtime
+ * /documents/note.json → /documents/note.json.mtime
+ * /documents/.note.json → /documents/.note.json.mtime
+ * /config.json         → /config.json.mtime
+ * /.keep               → /.keep.mtime
+ *
+ * NOTE: the sidecar is the data file name with `.mtime` appended — NO leading
+ * dot. This round-trips every name (including dotfiles): `.keep` →
+ * `.keep.mtime` → `.keep`. The previous leading-dot convention could not
+ * round-trip dotfiles, hence the pure-suffix form. Trade-off: a user file
+ * literally named `*.mtime` is treated as a sidecar.
  */
 export function mtimePathFor(filePath: string): string {
+  // Guard against nested sidecars: callers must pass the *data* file path, not
+  // a sidecar path. If a `.mtime` path slips through, warn and return it
+  // unchanged instead of producing a doubly-suffixed `*.mtime.mtime`.
+  if (filePath.endsWith('.mtime')) {
+    console.warn(
+      `[zen-fs-remotestoragejs] mtimePathFor received a path that already ends with ".mtime" (${filePath}); ` +
+      `returning it unchanged to avoid a nested sidecar. Pass the data file path instead.`,
+    );
+    return filePath;
+  }
   const lastSlash = filePath.lastIndexOf('/');
   const dir = lastSlash >= 0 ? filePath.slice(0, lastSlash) : '';
   const fileName = lastSlash >= 0 ? filePath.slice(lastSlash + 1) : filePath;
-  // Avoid double dot: if fileName already starts with '.', don't add another
-  const mtimeFileName = fileName.startsWith('.') ? `${fileName}.mtime` : `.${fileName}.mtime`;
+  const mtimeFileName = `${fileName}.mtime`;
   return dir ? `${dir}/${mtimeFileName}` : mtimeFileName;
 }
 
 /**
  * Check whether a filename is a .mtime sidecar file.
  *
- * .note.json.mtime → true
- * note.json        → false
+ * note.json.mtime → true
+ * note.json       → false
  */
 export function isMtimeSidecar(name: string): boolean {
-  return name.startsWith('.') && name.endsWith('.mtime');
+  return name.endsWith('.mtime') && name.length > 6;
 }

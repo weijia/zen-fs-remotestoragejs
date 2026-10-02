@@ -119,6 +119,9 @@ describe('Snapshot (shouldSync)', () => {
       return Promise.resolve({ ok: false, status: 404, headers: new Map() });
     });
 
+    // The first shouldSync() cached the dir listing (etag-v1); clear it so the
+    // re-mocked etag-v2 is actually fetched by the second call.
+    fs.clearExistenceCache();
     const result = await fs.shouldSync();
     expect(result).toBe(true);
   });
@@ -152,7 +155,7 @@ describe('Precise mtime (.mtime sidecar)', () => {
 
     // Should have written both the file and the sidecar
     expect(capturedUrls).toContain(baseUrl + '/app_data/test.json');
-    expect(capturedUrls).toContain(baseUrl + '/app_data/.test.json.mtime');
+    expect(capturedUrls).toContain(baseUrl + '/app_data/test.json.mtime');
   });
 
   it('writeFile does NOT write sidecar when preciseMtime is disabled', async () => {
@@ -170,7 +173,7 @@ describe('Precise mtime (.mtime sidecar)', () => {
     await noSidecarFs.writeFile('/test.json', '{"key":"value"}');
 
     expect(capturedUrls).toContain(baseUrl + '/app_data/test.json');
-    expect(capturedUrls).not.toContain(baseUrl + '/app_data/.test.json.mtime');
+    expect(capturedUrls).not.toContain(baseUrl + '/app_data/test.json.mtime');
   });
 
   it('stat returns precise mtime from sidecar', async () => {
@@ -179,8 +182,26 @@ describe('Precise mtime (.mtime sidecar)', () => {
     mockFetch.mockImplementation((url: string, init?: RequestInit) => {
       const method = init?.method || 'GET';
 
+      // Root directory listing so stat() can resolve /test.json via the listing.
+      if (url === baseUrl + '/app_data/' && method === 'GET') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Map([
+            ['content-type', 'application/ld+json'],
+            ['ETag', 'dir-etag-1'],
+          ]),
+          json: () => Promise.resolve({
+            '@graph': [
+              { '@id': 'test.json', 'Content-Length': '15', 'Last-Modified': 'Wed, 15 Nov 2023 12:00:00 GMT' },
+              { '@id': 'test.json.mtime' },
+            ],
+          }),
+        });
+      }
+
       // HEAD for file
-      if (url === baseUrl + '/app_data/test.json' && method === 'HEAD') {
+      if (url === baseUrl + '/app_data/test.json' && method === 'GET') {
         return Promise.resolve({
           ok: true,
           status: 200,
@@ -193,7 +214,7 @@ describe('Precise mtime (.mtime sidecar)', () => {
       }
 
       // GET for .mtime sidecar
-      if (url === baseUrl + '/app_data/.test.json.mtime' && method === 'GET') {
+      if (url === baseUrl + '/app_data/test.json.mtime' && method === 'GET') {
         return Promise.resolve({
           ok: true,
           status: 200,
@@ -213,7 +234,26 @@ describe('Precise mtime (.mtime sidecar)', () => {
     mockFetch.mockImplementation((url: string, init?: RequestInit) => {
       const method = init?.method || 'GET';
 
-      if (url === baseUrl + '/app_data/test.json' && method === 'HEAD') {
+      // Root directory listing (no sidecar entry) so stat() resolves /test.json
+      // via the listing and then falls back to Last-Modified when the sidecar
+      // GET 404s.
+      if (url === baseUrl + '/app_data/' && method === 'GET') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Map([
+            ['content-type', 'application/ld+json'],
+            ['ETag', 'dir-etag-1'],
+          ]),
+          json: () => Promise.resolve({
+            '@graph': [
+              { '@id': 'test.json', 'Content-Length': '15', 'Last-Modified': 'Wed, 15 Nov 2023 12:00:00 GMT' },
+            ],
+          }),
+        });
+      }
+
+      if (url === baseUrl + '/app_data/test.json' && method === 'GET') {
         return Promise.resolve({
           ok: true,
           status: 200,
@@ -226,7 +266,7 @@ describe('Precise mtime (.mtime sidecar)', () => {
       }
 
       // Sidecar not found
-      if (url === baseUrl + '/app_data/.test.json.mtime' && method === 'GET') {
+      if (url === baseUrl + '/app_data/test.json.mtime' && method === 'GET') {
         return Promise.resolve({ ok: false, status: 404, headers: new Map() });
       }
 
@@ -249,9 +289,9 @@ describe('Precise mtime (.mtime sidecar)', () => {
           json: () => Promise.resolve({
             '@graph': [
               { '@id': 'config.json' },
-              { '@id': '.config.json.mtime' },
+              { '@id': 'config.json.mtime' },
               { '@id': 'data.json' },
-              { '@id': '.data.json.mtime' },
+              { '@id': 'data.json.mtime' },
             ],
           }),
         });
@@ -262,8 +302,8 @@ describe('Precise mtime (.mtime sidecar)', () => {
     const entries = await fs.readdir('/');
     expect(entries).toContain('config.json');
     expect(entries).toContain('data.json');
-    expect(entries).not.toContain('.config.json.mtime');
-    expect(entries).not.toContain('.data.json.mtime');
+    expect(entries).not.toContain('config.json.mtime');
+    expect(entries).not.toContain('data.json.mtime');
     });
 
     it('readdir also filters nested (.mtime.mtime) and dotfile-data (.group-type.mtime) sidecars', async () => {
@@ -278,8 +318,8 @@ describe('Precise mtime (.mtime sidecar)', () => {
     				json: () => Promise.resolve({
     					'@graph': [
     						{ '@id': 'config.json' },
-    						{ '@id': '.config.json.mtime' },
-    						{ '@id': '.config.json.mtime.mtime' },
+    						{ '@id': 'config.json.mtime' },
+    						{ '@id': 'config.json.mtime.mtime' },
     						{ '@id': '.group-type.mtime' },
     						{ '@id': '.group-type.mtime.mtime' },
     						{ '@id': 'data.json' },
@@ -293,8 +333,8 @@ describe('Precise mtime (.mtime sidecar)', () => {
     	const entries = await fs.readdir('/');
     	expect(entries).toContain('config.json');
     	expect(entries).toContain('data.json');
-    	expect(entries).not.toContain('.config.json.mtime');
-    	expect(entries).not.toContain('.config.json.mtime.mtime');
+    	expect(entries).not.toContain('config.json.mtime');
+    	expect(entries).not.toContain('config.json.mtime.mtime');
     	expect(entries).not.toContain('.group-type.mtime');
     	expect(entries).not.toContain('.group-type.mtime.mtime');
     	});
@@ -327,7 +367,7 @@ describe('Precise mtime (.mtime sidecar)', () => {
     await fs.unlink('/test.json');
 
     expect(deletedUrls).toContain(baseUrl + '/app_data/test.json');
-    expect(deletedUrls).toContain(baseUrl + '/app_data/.test.json.mtime');
+    expect(deletedUrls).toContain(baseUrl + '/app_data/test.json.mtime');
   });
 
   it('touch writes mtime sidecar when preciseMtime is enabled', async () => {
@@ -341,7 +381,7 @@ describe('Precise mtime (.mtime sidecar)', () => {
 
     await fs.touch('/test.json', { mtimeMs: 1700000000123 });
 
-    expect(putUrls).toContain(baseUrl + '/app_data/.test.json.mtime');
+    expect(putUrls).toContain(baseUrl + '/app_data/test.json.mtime');
   });
 
   it('touch is no-op when preciseMtime is disabled', async () => {
@@ -382,7 +422,7 @@ describe('Precise mtime (.mtime sidecar)', () => {
       }
 
       // Sidecar GET
-      if (url === baseUrl + '/app_data/.test.json.mtime' && method === 'GET') {
+      if (url === baseUrl + '/app_data/test.json.mtime' && method === 'GET') {
         return Promise.resolve({
           ok: true,
           status: 200,
@@ -402,9 +442,14 @@ describe('Precise mtime (.mtime sidecar)', () => {
 
 describe('Utility functions', () => {
   it('mtimePathFor computes correct sidecar path', () => {
-    expect(mtimePathFor('foo/bar.json')).toBe('foo/.bar.json.mtime');
-    expect(mtimePathFor('config.json')).toBe('.config.json.mtime');
-    expect(mtimePathFor('/deep/nested/file.txt')).toBe('/deep/nested/.file.txt.mtime');
+    expect(mtimePathFor('foo/bar.json')).toBe('foo/bar.json.mtime');
+    expect(mtimePathFor('config.json')).toBe('config.json.mtime');
+    expect(mtimePathFor('/deep/nested/file.txt')).toBe('/deep/nested/file.txt.mtime');
+  });
+
+  it('mtimePathFor round-trips a dotfile (.keep) to itself', () => {
+    const sidecar = mtimePathFor('/nodes/.keep');
+    expect(sidecar).toBe('/nodes/.keep.mtime');
   });
 
   it('isMtimeSidecar detects sidecar files', () => {

@@ -220,14 +220,14 @@ For each file at path `/foo/bar.json`, a sidecar file `/foo/.bar.json.mtime` sto
 /foo/.bar.json.mtime    ← { "mtime": 1700000000123 }
 ```
 
-**Naming convention**: Same as zen-fs-config's `.version` sidecar pattern — prepend `.` to the filename, append `.mtime`.
+**Naming convention**: the sidecar is the data file name with `.mtime` appended — i.e. `<name>.mtime`, with NO leading dot. This round-trips every name (including dotfiles) through the reverse mapping used by other backends.
 
 ```typescript
 function mtimePathFor(filePath: string): string {
   const lastSlash = filePath.lastIndexOf('/');
   const dir = lastSlash >= 0 ? filePath.slice(0, lastSlash) : '';
   const fileName = lastSlash >= 0 ? filePath.slice(lastSlash + 1) : filePath;
-  const mtimeFileName = `.${fileName}.mtime`;
+  const mtimeFileName = `${fileName}.mtime`;
   return dir ? `${dir}/${mtimeFileName}` : mtimeFileName;
 }
 ```
@@ -353,7 +353,7 @@ Upper layer sees (via readdir):
 ```
 
 This makes sidecar files completely transparent to the upper layer:
-- `readdir()` filters out any entry matching the `.mtime` sidecar pattern (`.{filename}.mtime`)
+- `readdir()` filters out any entry matching the `.mtime` sidecar pattern (`<filename>.mtime`)
 - `writeFile()` creates the sidecar directly via its own PUT request
 - `stat()` reads the sidecar directly via its own GET request, then merges the mtime into the result
 - `unlink()` deletes the sidecar directly via its own DELETE request

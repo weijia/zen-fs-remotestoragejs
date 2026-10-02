@@ -220,14 +220,14 @@ RS 协议（draft-dejong-remotestorage-27）不支持：
 /foo/.bar.json.mtime    ← { "mtime": 1700000000123 }
 ```
 
-**命名约定**：与 zen-fs-config 的 `.version` sidecar 模式一致——在文件名前加 `.`，后缀加 `.mtime`。
+**命名约定**：侧车是数据文件名加上 `.mtime` 后缀，即 `<name>.mtime`，**不要**在前面加点。这样对所有文件名（包括 dotfile）都能通过其他后端的反向映射正确还原。
 
 ```typescript
 function mtimePathFor(filePath: string): string {
   const lastSlash = filePath.lastIndexOf('/');
   const dir = lastSlash >= 0 ? filePath.slice(0, lastSlash) : '';
   const fileName = lastSlash >= 0 ? filePath.slice(lastSlash + 1) : filePath;
-  const mtimeFileName = `.${fileName}.mtime`;
+  const mtimeFileName = `${fileName}.mtime`;
   return dir ? `${dir}/${mtimeFileName}` : mtimeFileName;
 }
 ```
@@ -353,7 +353,7 @@ RemoteStorage（物理上）：
 ```
 
 这使得 sidecar 文件对上层完全透明：
-- `readdir()` 过滤掉任何匹配 `.mtime` sidecar 模式（`.{filename}.mtime`）的条目
+- `readdir()` 过滤掉任何匹配 `.mtime` sidecar 模式（`<filename>.mtime`）的条目
 - `writeFile()` 通过自身的 PUT 请求直接创建 sidecar
 - `stat()` 通过自身的 GET 请求直接读取 sidecar，然后将 mtime 合并进结果
 - `unlink()` 通过自身的 DELETE 请求直接删除 sidecar

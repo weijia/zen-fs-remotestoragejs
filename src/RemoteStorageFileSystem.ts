@@ -25,6 +25,7 @@ import {
   joinPath,
   mtimePathFor,
   isMtimeSidecar,
+  sidecarToDataPath,
 } from './utils.js';
 import { createLogger, loggers } from './debug.js';
 import { createCacheStorage, CacheStorage } from './persistence.js';
@@ -576,9 +577,27 @@ export class RemoteStorageFileSystem extends FileSystem {
 
       // Filter out .mtime sidecar files from the returned names — they are
       // internal to RemoteStorageFileSystem and invisible to upper layers.
+      // While scanning, dynamically delete orphaned sidecars: a `.mtime` file
+      // whose data file is no longer present in the same directory. This keeps
+      // remote storage from accumulating stale sidecars. The deletion is
+      // fire-and-forget so readdir never blocks or fails on cleanup errors.
+      const entryNames = new Set(entries.keys());
       const names: string[] = [];
       for (const [name] of entries) {
-        if (!isMtimeSidecar(name)) names.push(name);
+        if (isMtimeSidecar(name)) {
+          const dataName = sidecarToDataPath(name);
+          const orphaned =
+            name.endsWith('.mtime.mtime') || // pathological nested sidecar
+            !dataName ||
+            !entryNames.has(dataName);
+          if (orphaned) {
+            const full = `${path}${name}`;
+            loggers.dir.log(`[RS-READDIR] pruning orphaned mtime sidecar: ${full}`);
+            void this.unlink(full).catch(() => {});
+          }
+          continue;
+        }
+        names.push(name);
       }
 
       loggers.dir.log(`[RS-READDIR] readdir(${path}) backend=${this.backendName}: ${entries.size} entries, returning ${names.length} visible names`);
@@ -594,6 +613,50 @@ export class RemoteStorageFileSystem extends FileSystem {
         `Failed to read directory ${path}: ${error instanceof Error ? error.message : String(error)}`
       );
     }
+  }
+
+  /**
+   * Recursively delete `.mtime` sidecar files whose data file no longer
+   * exists in remote storage (orphaned sidecars). Returns the number of
+   * sidecars removed. Safe to call at any time; each deletion is best-effort.
+   *
+   * NOTE: `readdir()` and the snapshot builder already prune orphans on the
+   * fly during normal operation; this method forces a full walk for an
+   * explicit, on-demand cleanup (e.g. from a maintenance task).
+   */
+  async pruneOrphanedMtimeSidecars(root: string = '/'): Promise<number> {
+    let removed = 0;
+    const stack: string[] = [root];
+    while (stack.length) {
+      const dir = stack.pop()!;
+      let entries: Map<string, DirEntry> | null;
+      try {
+        entries = await this.ensureDirListing(dir);
+      } catch {
+        continue;
+      }
+      if (!entries) continue;
+      const entryNames = new Set(entries.keys());
+      for (const [name, entry] of entries) {
+        if (entry.isDir) {
+          stack.push(joinPath(dir, name));
+          continue;
+        }
+        if (!isMtimeSidecar(name)) continue;
+        const dataName = sidecarToDataPath(name);
+        const orphaned = name.endsWith('.mtime.mtime') || !dataName || !entryNames.has(dataName);
+        if (orphaned) {
+          const full = joinPath(dir, name);
+          try {
+            await this.unlink(full);
+            removed++;
+          } catch {
+            // best-effort
+          }
+        }
+      }
+    }
+    return removed;
   }
 
   /**
@@ -2221,11 +2284,26 @@ export class RemoteStorageFileSystem extends FileSystem {
         }
       }
 
+      // Dynamic cleanup: while building the snapshot, delete orphaned `.mtime`
+      // sidecars (a sidecar whose data file isn't in this directory) so remote
+      // storage doesn't accumulate stale sidecars.
+      const itemNames = new Set(items.map(i => i.name));
+
       for (const item of items) {
         const itemPath = dirPath === '/' ? item.name : `${dirPath}/${item.name}`;
 
-        // Skip .mtime sidecar files — they are internal
+        // Skip .mtime sidecar files — they are internal. But first prune
+        // orphaned ones (data file missing in this directory).
         if (isMtimeSidecar(item.name)) {
+          const dataName = sidecarToDataPath(item.name);
+          const orphaned =
+            item.name.endsWith('.mtime.mtime') ||
+            !dataName ||
+            !itemNames.has(dataName);
+          if (orphaned) {
+            loggers.dir.log(`[RS-SNAPSHOT] pruning orphaned mtime sidecar: ${itemPath}`);
+            void this.unlink(itemPath).catch(() => {});
+          }
           continue;
         }
 

@@ -212,3 +212,23 @@ export function mtimePathFor(filePath: string): string {
 export function isMtimeSidecar(name: string): boolean {
   return name.endsWith('.mtime') && name.length > 6;
 }
+
+/**
+ * Reverse: given a sidecar path, return the data file path.
+ *
+ * /documents/note.json.mtime → /documents/note.json
+ * /nodes/.keep.mtime         → /nodes/.keep
+ * Returns null if the path is not a valid sidecar.
+ *
+ * Path style matches {@link mtimePathFor}: dir without trailing slash, no
+ * leading slash (e.g. `documents/note.json` not `/documents/note.json`).
+ */
+export function sidecarToDataPath(sidecarPath: string): string | null {
+  const lastSlash = sidecarPath.lastIndexOf('/');
+  const dir = lastSlash >= 0 ? sidecarPath.slice(0, lastSlash) : '';
+  const fileName = lastSlash >= 0 ? sidecarPath.slice(lastSlash + 1) : sidecarPath;
+  if (!fileName.endsWith('.mtime')) return null;
+  const dataFilename = fileName.slice(0, -6); // remove trailing '.mtime'
+  if (dataFilename === '') return null; // e.g. '.mtime' alone has no filename
+  return dir ? `${dir}/${dataFilename}` : dataFilename;
+}

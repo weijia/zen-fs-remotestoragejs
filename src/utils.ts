@@ -232,3 +232,36 @@ export function sidecarToDataPath(sidecarPath: string): string | null {
   if (dataFilename === '') return null; // e.g. '.mtime' alone has no filename
   return dir ? `${dir}/${dataFilename}` : dataFilename;
 }
+
+// ---------------------------------------------------------------------------
+// Dot-prefixed metadata sidecar helpers (.name.mtime / .name.version)
+// ---------------------------------------------------------------------------
+
+/**
+ * Suffixes that mark a dotfile as a metadata sidecar eligible for auto-cleanup.
+ */
+export const DOT_META_SUFFIXES = ['.mtime', '.version'] as const;
+
+/**
+ * Case 1 — single-dot metadata sidecar: name starts with '.' and contains one
+ * of {@link DOT_META_SUFFIXES} (`.mtime` / `.version`), e.g. `.note.json.mtime`.
+ */
+export function isDotMetaSidecar(name: string): boolean {
+  if (!name.startsWith('.')) return false;
+  return DOT_META_SUFFIXES.some((s) => name.includes(s));
+}
+
+/**
+ * Case 2 — double-dot file: ANY name that starts with `..`, regardless of
+ * whether it carries a `.version`/`.mtime` marker. These are deleted wholesale.
+ */
+export function isDoubleDotFile(name: string): boolean {
+  return name.startsWith('..');
+}
+
+/**
+ * Files that should be auto-deleted: EITHER case above (OR, never AND).
+ */
+export function isMetadataSidecarToDelete(name: string): boolean {
+  return isDotMetaSidecar(name) || isDoubleDotFile(name);
+}

@@ -26,6 +26,7 @@ import {
   mtimePathFor,
   isMtimeSidecar,
   sidecarToDataPath,
+  isMetadataSidecarToDelete,
 } from './utils.js';
 import { createLogger, loggers } from './debug.js';
 import { createCacheStorage, CacheStorage } from './persistence.js';
@@ -640,6 +641,23 @@ export class RemoteStorageFileSystem extends FileSystem {
       for (const [name, entry] of entries) {
         if (entry.isDir) {
           stack.push(joinPath(dir, name));
+          continue;
+        }
+        // Stale hidden metadata files to delete (OR, never AND):
+        //   - single-dot `.name.mtime` / `.name.version` sidecars, AND
+        //   - any `..`-prefixed file (`..name`, `..name.mtime`, ...)
+        // Handle these BEFORE the `.mtime` sidecar check below, since a dot-meta
+        // `.name.mtime` is also matched by isMtimeSidecar() but needs the
+        // different mapping.
+        // Per request: delete ALL of them unconditionally (not only orphans).
+        if (isMetadataSidecarToDelete(name)) {
+          const full = joinPath(dir, name);
+          try {
+            await this.unlink(full);
+            removed++;
+          } catch {
+            // best-effort
+          }
           continue;
         }
         if (!isMtimeSidecar(name)) continue;
@@ -2291,6 +2309,22 @@ export class RemoteStorageFileSystem extends FileSystem {
 
       for (const item of items) {
         const itemPath = dirPath === '/' ? item.name : `${dirPath}/${item.name}`;
+
+        // Skip stale hidden metadata files (internal) and delete them:
+        //   - single-dot `.name.mtime` / `.name.version` sidecars, AND
+        //   - any `..`-prefixed file (`..name`, `..name.mtime`, ...)
+        // Detection is OR, never AND (isMetadataSidecarToDelete). This branch
+        // must run BEFORE the `.mtime` sidecar check below: a dot-meta
+        // `.name.mtime` is also matched by isMtimeSidecar(), but its data file is
+        // the name with the leading dot AND the meta suffix removed
+        // (`.note.json.mtime` → `note.json`), a different mapping than
+        // sidecarToDataPath()'s `.note.json`.
+        if (isMetadataSidecarToDelete(item.name)) {
+          // Per request: delete ALL of them unconditionally (not only orphans).
+          loggers.dir.log(`[RS-SNAPSHOT] deleting stale dotfile: ${itemPath}`);
+          void this.unlink(itemPath).catch(() => {});
+          continue;
+        }
 
         // Skip .mtime sidecar files — they are internal. But first prune
         // orphaned ones (data file missing in this directory).

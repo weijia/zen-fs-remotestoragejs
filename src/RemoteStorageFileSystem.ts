@@ -585,6 +585,10 @@ export class RemoteStorageFileSystem extends FileSystem {
       const entryNames = new Set(entries.keys());
       const names: string[] = [];
       for (const [name] of entries) {
+        // `.keep` 是为了让"空目录"在 RemoteStorage 中存活而创建的内部占位文件
+        // （RemoteStorage 与 Git 一样无法存储空目录）。它不是用户文件，必须按
+        // 后端契约（zen-fs-sync/docs/SyncableFS.md §1/§2）对调用者隐藏。
+        if (name === '.keep') continue;
         if (isMtimeSidecar(name)) {
           const dataName = sidecarToDataPath(name);
           const orphaned =
@@ -762,16 +766,18 @@ export class RemoteStorageFileSystem extends FileSystem {
         this.logger.logResult('rmdir', path, 'Not a directory', false);
         throw new RemoteStorageError(`Not a directory: ${path}`);
       }
-      // Check directory entries
+      // Check directory entries — readdir() 现已隐藏内部的 `.keep` 占位文件，
+      // 因此这里返回的任一名称都是真实文件 / 子目录。
       const entries = await this.readdir(path);
-      if (entries.length > 1 || (entries.length === 1 && entries[0] !== '.keep')) {
+      if (entries.length > 0) {
         this.logger.logResult('rmdir', path, `Directory not empty: [${entries.join(', ')}]`, false);
-        throw new RemoteStorageError(`Directory not empty (except .keep): ${path}`);
+        throw new RemoteStorageError(`Directory not empty: ${path}`);
       }
-      // 删除 .keep 占位文件（如果存在）
-      if (entries.includes('.keep')) {
-        const keepFilePath = joinPath(path, '.keep');
-        await this.unlink(keepFilePath);
+      // 删除 .keep 占位文件（readdir 已对其隐藏，不会出现在 entries 中）
+      try {
+        await this.unlink(joinPath(path, '.keep'));
+      } catch {
+        // 无 .keep 或已删除，忽略
       }
       this.logger.logResult('rmdir', path, 'OK');
       this.removeFromExistenceCache(path);

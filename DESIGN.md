@@ -360,6 +360,8 @@ This makes sidecar files completely transparent to the upper layer:
 
 Sidecar files are never exposed to `zen-fs-sync` or `zen-fs-config`. They are an internal implementation detail of `RemoteStorageFileSystem`.
 
+> **Backend contract reference**: The rule "internal implementation files must be hidden from all caller-visible operations (`readdir` / `stat` / `createSnapshot` / `unlink` / `rmdir`)" is formalized in `zen-fs-sync/docs/SyncableFS.md` → 《后端实现契约》§1（内部实现文件必须对调用者隐藏）. It applies to **every** internal file, not just `.mtime` sidecars — including the directory placeholder (`.keep`) written by `mkdir`. **Known deviation**: this backend currently satisfies §1 for `.mtime` only; the `.keep` placeholder is still returned by `readdir` and is mistakenly synced as a user file. That leak must be fixed (hide `.keep` in `readdir` per §1) and must not be treated as contract-compliant.
+
 ### 2.8 How mtime Propagates Across Devices
 
 With the `writeFileWithMtime` interface, mtime propagation is now explicit:
